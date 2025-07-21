@@ -1,0 +1,338 @@
+arms-server.properties
+# specify environment, e.g. local, scrumdev
+# replace with local for local development
+env=${deployment.env}
+
+#local execution properties
+jms.jndi.factory.local=org.apache.activemq.artemis.jndi.ActiveMQInitialContextFactory
+jms.jndi.provider.url.local=tcp://localhost:61616
+jms.jndi.principal.local=guest
+jms.jndi.credentials.local=guest
+jms.max.pool.size.local=5
+
+tx.log.1.local=target/xa/arms-jms-server/tx1.log
+tx.log.2.local=target/xa/arms-jms-server/tx2.log
+tx.defaultTransactionTimeout.local=5
+tx.gracefulShutdownInterval.local=1
+
+db.heuser.driverClass.local=oracle.jdbc.xa.client.OracleXADataSource
+db.heuser.jdbcUrl.local=jdbc:oracle:thin:@nvmidev01.d2hawkeye.net:1521:scmdbd1
+db.heuser.user.local=heuser
+db.heuser.username.local=heuser
+db.heuser.password.local=oracle
+db.heuser.minPoolSize.local=1
+db.heuser.maxPoolSize.local=5
+
+db.helog.driverClass.local=oracle.jdbc.xa.client.OracleXADataSource
+db.helog.jdbcUrl.local=jdbc:oracle:thin:@nvmidev01.d2hawkeye.net:1521:scmdbd1
+db.helog.user.local=helog
+db.helog.username.local=helog
+db.helog.password.local=oracle
+db.helog.minPoolSize.local=1
+db.helog.maxPoolSize.local=5
+
+#platform
+jms.jndi.factory.platform=${jms.jndi.factory}
+jms.jndi.provider.url.platform=${jms.jndi.provider.url}
+jms.jndi.principal.platform=${jms.jndi.principal}
+jms.jndi.credentials.platform=${jms.jndi.credentials}
+jms.max.pool.size.platform=${jms.max.pool.size}
+
+tx.log.1.platform=${tx.log.1}
+tx.log.2.platform=${tx.log.2}
+tx.defaultTransactionTimeout.platform=${tx.defaultTransactionTimeout}
+tx.gracefulShutdownInterval.platform=${tx.gracefulShutdownInterval}
+
+db.heuser.driverClass.platform=${db.heuser.driverClass}
+db.heuser.jdbcUrl.platform=jdbc:oracle:thin:@(DESCRIPTION=(LOAD_BALANCE=yes)(FAILOVER=ON)(ADDRESS=(PROTOCOL=TCP)(HOST=${db.hostname})(PORT=${db.port}))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=${db.sid})))
+db.heuser.user.platform=${heuser.username}
+db.heuser.username.platform=${heuser.username}
+db.heuser.password.platform=${heuser.password}
+db.heuser.minPoolSize.platform=${db.heuser.minPoolSize}
+db.heuser.maxPoolSize.platform=${db.heuser.maxPoolSize}
+
+db.helog.driverClass.platform=${db.helog.driverClass}
+db.helog.jdbcUrl.platform=jdbc:oracle:thin:@(DESCRIPTION=(LOAD_BALANCE=yes)(FAILOVER=ON)(ADDRESS=(PROTOCOL=TCP)(HOST=${db.hostname})(PORT=${db.port}))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=${db.sid})))
+db.helog.user.platform=${helog.username}
+db.helog.username.platform=${helog.username}
+db.helog.password.platform=${helog.password}
+db.helog.minPoolSize.platform=${db.helog.minPoolSize}
+db.helog.maxPoolSize.platform=${db.helog.maxPoolSize}
+
+#Properties commons for all environments
+tx.serverId=arms-jms-server
+jms.connectionfactory.jndiname=ConnectionFactory
+jms.arms.cmd.topic.jndiname=jms/MI/ARMSCommand/Topic
+jms.job.request.in.queue.jndiname=jms/MI/ARMS/In/Queue
+jms.job.request.in.queue.max.consumers=5
+jms.job.request.maxMsgPerSec=20
+jms.job.response.out.queue.jndiname=jms/MI/ARMSService/Out/Queue
+jms.job.response.out.queue.max.consumers=5
+jms.job.response.maxMsgPerSec=20
+jms.immediate.job.response.topic.jndiname=jms/MI/ImmediateJobsResponse/Topic
+jms.notification.queue.jndiname=jms/MI/Notification/Queue
+jms.dead.letter.queue.jndiname=jms/MI.DeadLetter/Queue
+jms.expiry.queue.jndiname=jms/MI.Expiry/Queue
+default.arms.config.properties=classpath:default-arms-config.properties
+scheduler.scheduleTriggerIntervalSec=60
+#scheduler.supported.serviceId=
+archiveJobs.enabled=true
+jms.withdraw.timeoutSec=3
+email.from.cs.addr=clientService@cotiviti.com
+email.from.noreply.addr=noreply@cotiviti.com
+email.phone.num=(866) 269-0238
+
+ArchiveArmsJobsMapper.xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+  PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+  "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.vh.arms.dao.ArchiveArmsJobsMapper">
+
+	<insert id="archiveArmsJobs" parameterType="java.lang.Integer">
+		INSERT INTO ${helogDb}.LG_ARMs_JobArchv (
+			JobId, JobName, REQUESTER,REQRAPPID, REQRPRODUCTID,
+			REQUESTTIME, Source, Notify, Priority, ServiceId,
+			JobParams, TotQueTime, TotProcessTime, JobReport, RptName,
+			RptExt, CompletionTime, JobStartTime)
+		SELECT a.JobId, a.JobName, a.Requester, a.ReqrAppId, a.ReqrProductId,
+			a.RequestTime, a.Source, a.Notify, a.Priority, a.ServiceId,
+			a.JobParams, b.TotQueueTime, b.TotProcessTime, c.JobReport, c.RptName,
+			c.RptExt, a.CompletionTime, a.JobStartTime
+		FROM ${heuserDb}.USR_ARMs_Jobs a
+		LEFT JOIN ${heuserDb}.USR_ARMs_JobStatistics b ON a.JobId = b.JobId
+		LEFT JOIN ${heuserDb}.USR_ARMs_JobReports c ON a.JobId = c.JobId
+		LEFT JOIN ${heuserDb}.USR_ARMS_SOURCE d ON a.serviceid = d.serviceid
+		WHERE a.statusId = 7 
+			OR (a.STATUSID = 3 
+				AND CEIL(SYSDATE - Nvl(a.COMPLETIONTIME,SYSDATE)) 
+					>Nvl(d.expiryduration, #{armsJobExpirePeriod, javaType=int, jdbcType=NUMERIC}))
+	</insert>
+	
+	<update id="removeArchivedArmsJobs" parameterType="java.lang.Integer">
+		DELETE FROM ${heuserDb}.USR_ARMs_Jobs WHERE jobid IN 
+			(SELECT jobid FROM ${heuserDb}.usr_arms_jobs a 
+			LEFT JOIN ${heuserDb}.usr_Arms_source  b
+			ON a.serviceid = b.serviceid
+				WHERE
+			(a.statusId = 7 OR (a.STATUSID = 3 
+		 AND CEIL(SYSDATE - Nvl(a.COMPLETIONTIME,SYSDATE)) 
+		 > Nvl(b.expiryduration,#{armsJobExpirePeriod, javaType=int, jdbcType=NUMERIC})))
+		 AND EXISTS (SELECT 1 from ${helogDb}.LG_ARMs_JobArchv where JOBID = a.jobid
+     )
+)
+	</update>
+</mapper>
+
+
+Default-arms-config.properties
+SMTPHOST=
+MAINURL=
+ARMS_DEFERSTARTTIME=2100
+ARMS_DEFERENDTIME=0600
+ARMS_JOBEXPIREPERIOD=30
+ARMS_ARCHIVESTARTTIME=2300
+D2RMURL=
+ARMS_HEALTHCHECKINTERVAL=60
+ARMS_MAXMEMBERDOWNTIME=600
+ARMS_JOBTIMEOUTINTERVAL=600
+ARMS_DEFERCRONPATTERN=* * 21-5 * * ? *
+
+
+arms-server-context.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:camel="http://camel.apache.org/schema/spring"
+	xmlns:context="http://www.springframework.org/schema/context"
+	xmlns:util="http://www.springframework.org/schema/util"
+	xmlns:tx="http://www.springframework.org/schema/tx"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+		http://www.springframework.org/schema/util http://www.springframework.org/schema/util/spring-util.xsd
+		http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd
+		http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context.xsd
+		http://www.springframework.org/schema/tx http://www.springframework.org/schema/tx/spring-tx.xsd">
+
+	<context:property-placeholder location="${arms.server.properties}" />
+	
+	
+
+	<context:annotation-config />
+	<context:component-scan base-package="com.vh.arms" />
+
+	<import resource="classpath:META-INF/spring/tx-context.xml" />
+	<!-- 
+	<import resource="classpath:META-INF/spring/jms-context.xml" />
+	 -->
+	<!-- JMS context start here -->
+	<bean id="jndiTemplate"	class="org.springframework.jndi.JndiTemplate">
+		<property name="environment">
+			<bean class="com.vh.arms.jndi.JndiProperties" init-method="init">
+				<constructor-arg>
+					<list>
+						<util:properties
+							location="${arms.server.properties}" />
+							<util:properties
+							location="classpath:service-id-mapping.properties" />
+					</list>
+				</constructor-arg>
+			</bean>
+		</property>
+	</bean>
+
+	<bean id="pooledJmsXaConnectionFactory" class="bitronix.tm.resource.jms.PoolingConnectionFactory" 
+	     init-method="init" destroy-method="close">
+		<property name="className" value="bitronix.tm.resource.jms.JndiXAConnectionFactory" />
+		<property name="uniqueName" value="pooledJmsXaConnectionFactory" />
+		<property name="maxPoolSize" value="${jms.max.pool.size.${env}}" />
+		<property name="user" value="${jms.jndi.principal.${env}}" />
+		<property name="password" value="${jms.jndi.credentials.${env}}" />
+		<property name="testConnections" value="false" />
+		<property name="driverProperties">
+			<props>
+				<prop key="initialContextFactory">${jms.jndi.factory.${env}}</prop>
+				<prop key="providerUrl">${jms.jndi.provider.url.${env}}</prop>
+				<prop key="name">${jms.connectionfactory.jndiname}</prop>
+				<prop key="securityPrincipal">${jms.jndi.principal.${env}}</prop>
+				<prop key="securityCredentials">${jms.jndi.credentials.${env}}</prop>
+			</props>
+		</property>
+		<property name="allowLocalTransactions" value="true" />
+	</bean>
+
+	<bean id="jndiDestinationResolver" class="org.springframework.jms.support.destination.JndiDestinationResolver">
+		<property name="jndiTemplate" ref="jndiTemplate" />
+	</bean>
+
+	<bean id="jmsConfiguration" class="org.apache.camel.component.jms.JmsConfiguration">
+		<property name="connectionFactory" ref="pooledJmsXaConnectionFactory" />
+		<property name="transactionManager" ref="jtaTransactionManager" />
+		<property name="transacted" value="true" />
+		<property name="destinationResolver" ref="jndiDestinationResolver" />
+		<property name="maxConcurrentConsumers" value="5" />
+
+	</bean>
+
+	<bean id="jms" class="org.apache.camel.component.jms.JmsComponent">
+		<property name="configuration" ref="jmsConfiguration" />
+	</bean>
+
+	<bean id="jmsNonTxConfiguration" class="org.apache.camel.component.jms.JmsConfiguration">
+		<property name="connectionFactory" ref="pooledJmsXaConnectionFactory" />
+		<property name="transacted" value="false" />
+		<property name="destinationResolver" ref="jndiDestinationResolver" />
+		<property name="maxConcurrentConsumers" value="5" />
+	</bean>
+
+	<bean id="jmsNonTx" class="org.apache.camel.component.jms.JmsComponent">
+		<property name="configuration" ref="jmsNonTxConfiguration" />
+	</bean>
+	
+	<!-- JMS context end here -->
+	<import resource="classpath:META-INF/spring/heuser-jdbc-context.xml" />
+	<import resource="classpath:META-INF/spring/helog-jdbc-context.xml" />
+	<import resource="arms-server-dao-context.xml" />
+	<import resource="classpath:META-INF/spring/jms-topic-context.xml" />
+
+	<tx:annotation-driven transaction-manager="jtaTransactionManager"/>
+
+	<bean id="headerPopulator" class="com.vh.arms.processor.HeaderPopulator" />
+
+	<bean id="armsCommandProcessor" class="com.vh.arms.processor.ArmsCommandProcessor" />
+
+	<bean id="createJobProcessor" class="com.vh.arms.processor.CreateJobProcessor"/>
+	
+	<bean id="armsJobActionProcessor" class="com.vh.arms.processor.ArmsJobActionProcessor"/>
+	
+	<bean id="armsResponseGenerator" class="com.vh.arms.processor.ArmsResponseGenerator"/>
+
+	<bean id="armsJobStatusBean" class="com.vh.arms.processor.ArmsJobStatusBean"/>
+
+	<bean id="scheduleTriggerIntervalSec" class="java.lang.Integer">
+		<constructor-arg value="5" />
+	</bean>
+
+	<bean id="emailInfoProcessor" class="com.vh.arms.processor.EmailInfoProcessor">
+		<property name="phoneNumber" value="${email.phone.num}" />
+		<property name="mailFromCS" value="${email.from.cs.addr}" />
+		<property name="mailFromNoReply" value="${email.from.noreply.addr}" />
+	</bean>
+
+	<bean id="notificationProcessor" class="com.vh.arms.processor.NotificationProcessor">
+		<constructor-arg name="notificationDTOClassname"
+			value="com.verscend.mx.applicationservice.services.notification.Notification" />
+	</bean>
+
+	<bean id="routeBuilder" class="com.vh.arms.routes.ArmsRouteBuilder">
+		<property name="jobRequestInQueue"
+			value="jms:queue:${jms.job.request.in.queue.jndiname}?maxConcurrentConsumers=${jms.job.request.in.queue.max.consumers}" />
+		<property name="jobResponseOutQueue"
+			value="jms:queue:${jms.job.response.out.queue.jndiname}?maxConcurrentConsumers=${jms.job.response.out.queue.max.consumers}" />
+		<property name="immediateJobResponseTopic"
+			value="jms:topic:${jms.immediate.job.response.topic.jndiname}" />
+		<property name="deadLetterQueue"
+			value="jms:queue:${jms.dead.letter.queue.jndiname}" />
+		<property name="expiryQueue"
+			value="jms:queue:${jms.expiry.queue.jndiname}" />
+		<property name="armsCmdTopic" value="jms:topic:${jms.arms.cmd.topic.jndiname}" />
+		<property name="armsCmdTopicStatus" value="jms:topic:${jms.arms.cmd.topic.jndiname}?selector=MESSAGE_TYPE = 'STATUS' OR MESSAGE_TYPE = 'HEARTBEAT'" />
+		<property name="notificationQueue" value="jms:queue:${jms.notification.queue.jndiname}" />
+		<property name="scheduleTriggerIntervalSec" value="${scheduler.scheduleTriggerIntervalSec}" />
+		<property name="archiveArmsJobsCronPattern" value="0+%s+%s+?+*+*" />
+		<property name="maxArmsRequestPerSec" value="${jms.job.request.maxMsgPerSec}" />
+		<property name="maxServiceResponsePerSec" value="${jms.job.response.maxMsgPerSec}" />
+		<property name="autoStartArchiveJobs" value="${archiveJobs.enabled:true}" />
+	</bean>
+
+	<bean id="withdrawJobBean" class="com.vh.arms.processor.WithdrawJobBean">
+		<property name="uriTemplate" value="%s?selector=JOB_ID=%d" />
+		<property name="withdrawTimeout" value="${jms.withdraw.timeoutSec:3}" />
+	</bean>
+	
+	<bean id="armsJobScheduleProcessor" class="com.vh.arms.processor.ArmsJobScheduleProcessor">
+		<property name="schedulePollInterval" value="${scheduler.scheduleTriggerIntervalSec}" />
+	</bean>
+	
+	<util:properties id="service-id-mapping"
+		location="classpath:service-id-mapping.properties" />
+
+	<util:properties id="defaultArmsConfigProperties"
+		location="${default.arms.config.properties}" />
+
+	<bean id="queueRouter" class="com.vh.arms.routes.QueueRouter">
+		<property name="uriTemplateWithPriority" value="jms:queue:%s?preserveMessageQos=true" />
+		<property name="uriTemplate" value="jms:queue:%s" />
+		<property name="serviceId2JMSQueues" ref="service-id-mapping" />
+	</bean>
+
+	<bean id="dto" class="org.apache.camel.model.DataFormatDefinition">
+		<property name="dataFormat" ref="arms.dto" />
+	</bean>
+
+	<bean id="arms.dto" class="org.apache.camel.converter.jaxb.JaxbDataFormat">
+		<constructor-arg name="contextPath" type="java.lang.String"
+			value="com.vh.arms.dto" />
+		<property name="prettyPrint" value="true" />
+	</bean>
+
+	<bean id="armsConfigFactory" class="com.vh.arms.utils.ArmsConfigFactory"/>
+
+	<bean id="armsConfig" class="java.util.Properties" factory-bean="armsConfigFactory" factory-method="getArmsConfig"/>
+ 
+	<bean id="archiveArmsJobsProcessor" class="com.vh.arms.processor.ArchiveArmsJobsProcessor"/>
+
+	<bean id="archiveUserNotificationProcessor" class="com.vh.arms.processor.ArchiveNotificationsProcessor"/>
+
+	<bean id="heartbeatAggregateBean" class="com.vh.arms.processor.HeartbeatAggregateBean"/>
+
+	<bean id="armsServiceStatusProcessor" class="com.vh.arms.processor.ArmsServiceStatusProcessor"/>
+
+	<bean id="scheduleJobBean" class="com.vh.arms.processor.ScheduleJobBean">
+		<property name="supportedServiceIds" value="${scheduler.supported.serviceId:}" />
+	</bean>
+
+	<camelContext xmlns="http://camel.apache.org/schema/spring" id="camelContext">
+		<routeBuilder ref="routeBuilder" />
+	</camelContext>
+
+</beans>
+
