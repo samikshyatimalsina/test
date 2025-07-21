@@ -1,0 +1,295 @@
+The archive process works as follows:
+
+**1. Archive Insertion Logic:**  
+- Jobs are moved from the main job table to the archive table (`lg_arms_jobarchv`) by a scheduled process.
+- The scheduler is triggered based on a configured interval (e.g., every 60 seconds).
+- The process selects jobs from the main table that meet certain criteria (e.g., completed and older than a threshold) and inserts them into the archive table.
+
+**2. Archive Start Time:**  
+- The property `ARMS_ARCHIVESTARTTIME=2300` in `default-arms-config.properties` means the archive process is allowed to start at 23:00 (11 PM) server time.
+- The process will only run and move jobs to the archive table after this time.
+
+**3. Expiry Duration:**  
+- The property `ARMS_JOBEXPIREPERIOD=30` means jobs older than 30 days (or the configured period) are eligible for archiving.
+- Only jobs that have completed and are older than this period are selected for archiving.
+
+**4. When Jobs Move to Archive Table:**  
+- After the archive start time (e.g., 23:00), the scheduler checks for jobs in the main table that are older than the expiry period.
+- These jobs are inserted into the archive table.
+
+**Possible Reason for Duplicates:**  
+- If the archive process does not check for existing entries before inserting, or if the same job is selected multiple times due to timing or transaction issues, duplicate entries can occur.
+- There may be a missing unique constraint on `jobid` in the archive table, or the insert logic does not use `INSERT IGNORE` or `ON DUPLICATE KEY UPDATE`.
+
+**Summary:**  
+- Jobs are archived after `ARMS_ARCHIVESTARTTIME` if they are older than `ARMS_JOBEXPIREPERIOD`.
+- Duplicates can happen if the archive logic does not prevent re-inserting the same job.
+
+To prevent duplicates, ensure the archive table has a unique constraint on `jobid` and the insert logic checks for existing records before inserting.
+
+
+Here’s how scheduling, archive start, and expiry duration work together in a real-world scenario:
+
+1. **Expiry Duration** (`ARMS_JOBEXPIREPERIOD`):  
+   - Defines how old a job must be (e.g., 30 days after completion) before it is eligible for archiving.
+
+2. **Archive Start Time** (`ARMS_ARCHIVESTARTTIME`):  
+   - Specifies the earliest time of day (e.g., 23:00) when the archive process is allowed to run.
+
+3. **Scheduling (Cron Pattern)** (`ARMS_DEFERCRONPATTERN`):  
+   - Controls how often and when the archiving job/process is triggered (e.g., every minute between 21:00 and 05:59).
+
+**How they work together:**
+- The scheduler triggers the archive process at configured intervals (e.g., every minute at night).
+- When triggered, the process checks for jobs whose completion time is older than the expiry duration (e.g., completed more than 30 days ago).
+- The process only runs after the archive start time (e.g., after 23:00).
+- Eligible jobs are archived (moved to the archive table) and removed from the main table.
+
+**Example:**  
+- A job completed on July 11, 8:00 AM.
+- With a 30-day expiry, it becomes eligible on August 10, 8:00 AM.
+- The archive process runs every minute between 21:00 and 05:59.
+- The job will be archived the first time the process runs after August 10, 23:00.
+
+**Summary:**  
+- **Expiry duration** decides eligibility.
+- **Archive start time** restricts when archiving can begin each day.
+- **Scheduling** determines how often the process checks for eligible jobs.  
+All three must align for a job to be archived.
+
+
+
+
+
+
+
+The cron pattern used for scheduling is determined by the value injected into the `archiveArmsJobsCronPattern` property of the `routeBuilder` bean in `arms-server-context.xml`. This value can be set directly in the XML (as a template) or overridden by external configuration.
+
+- If you have a property defined in `default-arms-config.properties` (or another properties file loaded via `${...}`), and the XML uses `${propertyName}` for the value, then the external property takes precedence.
+- In your `arms-server-context.xml`, the value is hardcoded as `0+%s+%s+?+*+*`, which is a template. Unless overridden by a property, this template is used.
+
+**Summary:**  
+- If `archiveArmsJobsCronPattern` is set via a property in `default-arms-config.properties`, that value is used.
+- If not, the value from `arms-server-context.xml` is used.
+
+Check if `archiveArmsJobsCronPattern` is defined in your properties files. If so, it overrides the XML. If not, the XML value is used.
+
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:camel="http://camel.apache.org/schema/spring"
+	xmlns:context="http://www.springframework.org/schema/context"
+	xmlns:util="http://www.springframework.org/schema/util"
+	xmlns:tx="http://www.springframework.org/schema/tx"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+		http://www.springframework.org/schema/util http://www.springframework.org/schema/util/spring-util.xsd
+		http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd
+		http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context.xsd
+		http://www.springframework.org/schema/tx http://www.springframework.org/schema/tx/spring-tx.xsd">
+
+	<context:property-placeholder location="${arms.server.properties}" />
+	
+	
+
+	<context:annotation-config />
+	<context:component-scan base-package="com.vh.arms" />
+
+	<import resource="classpath:META-INF/spring/tx-context.xml" />
+	<!-- 
+	<import resource="classpath:META-INF/spring/jms-context.xml" />
+	 -->
+	<!-- JMS context start here -->
+	<bean id="jndiTemplate"	class="org.springframework.jndi.JndiTemplate">
+		<property name="environment">
+			<bean class="com.vh.arms.jndi.JndiProperties" init-method="init">
+				<constructor-arg>
+					<list>
+						<util:properties
+							location="${arms.server.properties}" />
+							<util:properties
+							location="classpath:service-id-mapping.properties" />
+					</list>
+				</constructor-arg>
+			</bean>
+		</property>
+	</bean>
+
+	<bean id="pooledJmsXaConnectionFactory" class="bitronix.tm.resource.jms.PoolingConnectionFactory" 
+	     init-method="init" destroy-method="close">
+		<property name="className" value="bitronix.tm.resource.jms.JndiXAConnectionFactory" />
+		<property name="uniqueName" value="pooledJmsXaConnectionFactory" />
+		<property name="maxPoolSize" value="${jms.max.pool.size.${env}}" />
+		<property name="user" value="${jms.jndi.principal.${env}}" />
+		<property name="password" value="${jms.jndi.credentials.${env}}" />
+		<property name="testConnections" value="false" />
+		<property name="driverProperties">
+			<props>
+				<prop key="initialContextFactory">${jms.jndi.factory.${env}}</prop>
+				<prop key="providerUrl">${jms.jndi.provider.url.${env}}</prop>
+				<prop key="name">${jms.connectionfactory.jndiname}</prop>
+				<prop key="securityPrincipal">${jms.jndi.principal.${env}}</prop>
+				<prop key="securityCredentials">${jms.jndi.credentials.${env}}</prop>
+			</props>
+		</property>
+		<property name="allowLocalTransactions" value="true" />
+	</bean>
+
+	<bean id="jndiDestinationResolver" class="org.springframework.jms.support.destination.JndiDestinationResolver">
+		<property name="jndiTemplate" ref="jndiTemplate" />
+	</bean>
+
+	<bean id="jmsConfiguration" class="org.apache.camel.component.jms.JmsConfiguration">
+		<property name="connectionFactory" ref="pooledJmsXaConnectionFactory" />
+		<property name="transactionManager" ref="jtaTransactionManager" />
+		<property name="transacted" value="true" />
+		<property name="destinationResolver" ref="jndiDestinationResolver" />
+		<property name="maxConcurrentConsumers" value="5" />
+
+	</bean>
+
+	<bean id="jms" class="org.apache.camel.component.jms.JmsComponent">
+		<property name="configuration" ref="jmsConfiguration" />
+	</bean>
+
+	<bean id="jmsNonTxConfiguration" class="org.apache.camel.component.jms.JmsConfiguration">
+		<property name="connectionFactory" ref="pooledJmsXaConnectionFactory" />
+		<property name="transacted" value="false" />
+		<property name="destinationResolver" ref="jndiDestinationResolver" />
+		<property name="maxConcurrentConsumers" value="5" />
+	</bean>
+
+	<bean id="jmsNonTx" class="org.apache.camel.component.jms.JmsComponent">
+		<property name="configuration" ref="jmsNonTxConfiguration" />
+	</bean>
+	
+	<!-- JMS context end here -->
+	<import resource="classpath:META-INF/spring/heuser-jdbc-context.xml" />
+	<import resource="classpath:META-INF/spring/helog-jdbc-context.xml" />
+	<import resource="arms-server-dao-context.xml" />
+	<import resource="classpath:META-INF/spring/jms-topic-context.xml" />
+
+	<tx:annotation-driven transaction-manager="jtaTransactionManager"/>
+
+	<bean id="headerPopulator" class="com.vh.arms.processor.HeaderPopulator" />
+
+	<bean id="armsCommandProcessor" class="com.vh.arms.processor.ArmsCommandProcessor" />
+
+	<bean id="createJobProcessor" class="com.vh.arms.processor.CreateJobProcessor"/>
+	
+	<bean id="armsJobActionProcessor" class="com.vh.arms.processor.ArmsJobActionProcessor"/>
+	
+	<bean id="armsResponseGenerator" class="com.vh.arms.processor.ArmsResponseGenerator"/>
+
+	<bean id="armsJobStatusBean" class="com.vh.arms.processor.ArmsJobStatusBean"/>
+
+	<bean id="scheduleTriggerIntervalSec" class="java.lang.Integer">
+		<constructor-arg value="5" />
+	</bean>
+
+	<bean id="emailInfoProcessor" class="com.vh.arms.processor.EmailInfoProcessor">
+		<property name="phoneNumber" value="${email.phone.num}" />
+		<property name="mailFromCS" value="${email.from.cs.addr}" />
+		<property name="mailFromNoReply" value="${email.from.noreply.addr}" />
+	</bean>
+
+	<bean id="notificationProcessor" class="com.vh.arms.processor.NotificationProcessor">
+		<constructor-arg name="notificationDTOClassname"
+			value="com.verscend.mx.applicationservice.services.notification.Notification" />
+	</bean>
+
+	<bean id="routeBuilder" class="com.vh.arms.routes.ArmsRouteBuilder">
+		<property name="jobRequestInQueue"
+			value="jms:queue:${jms.job.request.in.queue.jndiname}?maxConcurrentConsumers=${jms.job.request.in.queue.max.consumers}" />
+		<property name="jobResponseOutQueue"
+			value="jms:queue:${jms.job.response.out.queue.jndiname}?maxConcurrentConsumers=${jms.job.response.out.queue.max.consumers}" />
+		<property name="immediateJobResponseTopic"
+			value="jms:topic:${jms.immediate.job.response.topic.jndiname}" />
+		<property name="deadLetterQueue"
+			value="jms:queue:${jms.dead.letter.queue.jndiname}" />
+		<property name="expiryQueue"
+			value="jms:queue:${jms.expiry.queue.jndiname}" />
+		<property name="armsCmdTopic" value="jms:topic:${jms.arms.cmd.topic.jndiname}" />
+		<property name="armsCmdTopicStatus" value="jms:topic:${jms.arms.cmd.topic.jndiname}?selector=MESSAGE_TYPE = 'STATUS' OR MESSAGE_TYPE = 'HEARTBEAT'" />
+		<property name="notificationQueue" value="jms:queue:${jms.notification.queue.jndiname}" />
+		<property name="scheduleTriggerIntervalSec" value="${scheduler.scheduleTriggerIntervalSec}" />
+		<property name="archiveArmsJobsCronPattern" value="0+%s+%s+?+*+*" />
+		<property name="maxArmsRequestPerSec" value="${jms.job.request.maxMsgPerSec}" />
+		<property name="maxServiceResponsePerSec" value="${jms.job.response.maxMsgPerSec}" />
+		<property name="autoStartArchiveJobs" value="${archiveJobs.enabled:true}" />
+	</bean>
+
+	<bean id="withdrawJobBean" class="com.vh.arms.processor.WithdrawJobBean">
+		<property name="uriTemplate" value="%s?selector=JOB_ID=%d" />
+		<property name="withdrawTimeout" value="${jms.withdraw.timeoutSec:3}" />
+	</bean>
+	
+	<bean id="armsJobScheduleProcessor" class="com.vh.arms.processor.ArmsJobScheduleProcessor">
+		<property name="schedulePollInterval" value="${scheduler.scheduleTriggerIntervalSec}" />
+	</bean>
+	
+	<util:properties id="service-id-mapping"
+		location="classpath:service-id-mapping.properties" />
+
+	<util:properties id="defaultArmsConfigProperties"
+		location="${default.arms.config.properties}" />
+
+	<bean id="queueRouter" class="com.vh.arms.routes.QueueRouter">
+		<property name="uriTemplateWithPriority" value="jms:queue:%s?preserveMessageQos=true" />
+		<property name="uriTemplate" value="jms:queue:%s" />
+		<property name="serviceId2JMSQueues" ref="service-id-mapping" />
+	</bean>
+
+	<bean id="dto" class="org.apache.camel.model.DataFormatDefinition">
+		<property name="dataFormat" ref="arms.dto" />
+	</bean>
+
+	<bean id="arms.dto" class="org.apache.camel.converter.jaxb.JaxbDataFormat">
+		<constructor-arg name="contextPath" type="java.lang.String"
+			value="com.vh.arms.dto" />
+		<property name="prettyPrint" value="true" />
+	</bean>
+
+	<bean id="armsConfigFactory" class="com.vh.arms.utils.ArmsConfigFactory"/>
+
+	<bean id="armsConfig" class="java.util.Properties" factory-bean="armsConfigFactory" factory-method="getArmsConfig"/>
+ 
+	<bean id="archiveArmsJobsProcessor" class="com.vh.arms.processor.ArchiveArmsJobsProcessor"/>
+
+	<bean id="archiveUserNotificationProcessor" class="com.vh.arms.processor.ArchiveNotificationsProcessor"/>
+
+	<bean id="heartbeatAggregateBean" class="com.vh.arms.processor.HeartbeatAggregateBean"/>
+
+	<bean id="armsServiceStatusProcessor" class="com.vh.arms.processor.ArmsServiceStatusProcessor"/>
+
+	<bean id="scheduleJobBean" class="com.vh.arms.processor.ScheduleJobBean">
+		<property name="supportedServiceIds" value="${scheduler.supported.serviceId:}" />
+	</bean>
+
+	<camelContext xmlns="http://camel.apache.org/schema/spring" id="camelContext">
+		<routeBuilder ref="routeBuilder" />
+	</camelContext>
+
+</beans>
+
+
+then in SMTPHOST=
+MAINURL=
+ARMS_DEFERSTARTTIME=2100
+ARMS_DEFERENDTIME=0600
+ARMS_JOBEXPIREPERIOD=30
+ARMS_ARCHIVESTARTTIME=2300
+D2RMURL=
+ARMS_HEALTHCHECKINTERVAL=60
+ARMS_MAXMEMBERDOWNTIME=600
+ARMS_JOBTIMEOUTINTERVAL=600
+ARMS_DEFERCRONPATTERN=* * 21-5 * * ? *
+
+
+
+
+
+
+
+
