@@ -1,0 +1,2757 @@
+
+This is the packageExport service implemantation. I need to focus on the updateAndExportPackage method
+public class PackageExportServiceImpl implements PackageExportService {
+
+    private static final Logger LOGGER = LoggerFactory
+            .getLogger(PackageExportServiceImpl.class);
+    private static final String SCHEDULE_DATE_LABEL = "Latest Run";
+    private static final String BUSINESS_LEVELS_KEY = "businessLevels";
+    private static final String PAGE_STATE_KEY = "pageState";
+    private static final String FIXED_PARAMS_CBE_USER_KEY = "CBE_User";
+    private static final String FIXED_PARAMS_CBE_PASS_WORD_KEY = "CBE_Password";
+    private static final String FIXED_PARAMS_CBE_URL_KEY = "CBE_URL";
+
+
+    private final CredentialProvider cp;
+
+    private final ApplicationContext context;
+
+    private final DatabaseConfigService databaseConfigService;
+
+    private final ViewExportSubService viewExportSubService;
+
+    private final ViewExportService viewExportService;
+
+    private final CBETokenService cbeTokenService;
+
+    private final RetryEndpointExecutor retryExecutor;
+
+    private final BatchExportErrorEmailSender batchExportErrorEmailSender;
+    
+    private final BatchExportNotificationSender batchExportNotificationSender;
+    
+   
+
+    @Value("${api.url}")
+    private String apiBasePath;
+    
+  
+
+    @Autowired
+    public PackageExportServiceImpl(CredentialProvider cp,
+                                    ApplicationContext context,
+                                    DatabaseConfigService databaseConfigService,
+                                    ViewExportSubService viewExportSubService,
+                                    ViewExportService viewExportService,
+                                    CBETokenService cbeTokenService,
+                                    RetryEndpointExecutor retryExecutor,
+                                    BatchExportErrorEmailSender batchExportErrorEmailSender,
+                                    BatchExportNotificationSender batchExportNotificationSender) {
+        this.cp = cp;
+        this.context = context;
+        this.databaseConfigService = databaseConfigService;
+        this.viewExportSubService = viewExportSubService;
+        this.viewExportService = viewExportService;
+        this.cbeTokenService = cbeTokenService;
+        this.retryExecutor = retryExecutor;
+        this.batchExportErrorEmailSender = batchExportErrorEmailSender;
+        this.batchExportNotificationSender = batchExportNotificationSender;
+    }
+
+    @Override
+    public ResponseDTO getPackages(PackageExportDTO dto, String appId) {
+        init(appId, dto);
+        if (null == dto.getFilterScope()) {
+            dto.setFilterScope(PackageExportDTO.FilterPackages.MY);
+        }
+        PackageExportDao dao = getDao(appId);
+        final List<PackageResponseDTO> packages = dto.isShowDetail() ?
+                dao.getAllPackageDetail(dto, getAllColumns()) : dao.getAllPackages(dto);
+        if (dto.isShowDetail()) {
+            BatchExportPackageUtils.setState(packages, dao);
+        }
+        final ResponseDTO responseDTO = new ResponseDTO();
+        responseDTO.setData(packages);
+        final Map<String, Object> meta = new HashMap<>();
+        meta.put(RECORDCOUNT, CollectionUtils.isEmpty(packages) ? 0L
+                : packages.get(0).getRecordCount());
+        responseDTO.setMeta(meta);
+        return responseDTO;
+    }
+
+    @Override
+    public ResponseDTO getUsers(String appId,
+                                Long pkgId, String userId) {
+        PackageExportDao dao = getDao(appId);
+        final List<PackageSharedUserDTO> userDetails = dao
+                .getUserDetails(appId, pkgId, userId);
+        ResponseDTO responseDTO = new ResponseDTO();
+        responseDTO.setData(userDetails);
+        return responseDTO;
+    }
+
+    @Override
+    public void sharePackage(String appId, Long pkgId, PackageShareDTO packageShareDTO) {
+        PackageExportDao dao = getDao(appId);
+        dao.sharePackage(pkgId, packageShareDTO, batchExportNotificationSender);
+    }
+
+    @Override
+    public void updatePackageSubscription(String appId, FilterCriteria sharedPackages) {
+        PackageExportDao dao = getDao(appId);
+        dao.updatePackageSubscription(cp.getUserId(), sharedPackages);
+    }
+
+    @Override
+    public void updatedPOPDatesInPosting(String appId) {
+        PackageExportDao dao = getDao(appId);
+        dao.updatedPOPDatesInPosting(appId);
+    }
+
+    @Override
+    public ResponseDTO getPackageBusinessLevel(PackageResponseDTO dto,
+                                               String appId) {
+        final ResponseDTO responseDTO = new ResponseDTO();
+        final PackageExportDao dao = getDao(appId);
+        responseDTO.setData(BatchExportPackageUtils.getBusinessLevelState(dao,
+                dao.getMaxLevel(), dto));
+        return responseDTO;
+    }
+
+    @Override
+    public ResponseDTO importBusinessLevelsFromView(PackageResponseDTO dto, String appId) {
+    	  ResponseDTO responseDTO = new ResponseDTO();
+         PackageExportDao dao = getDao(appId);
+         responseDTO.setData(BatchExportPackageUtils.importBusinessLevelState(dao,
+                 dao.getMaxLevel(), dto));
+         return responseDTO;
+    }
+
+    @Override
+    public ResponseDTO getMyDownloadBusinessLevel(
+            PackageDownloadResponseDTO dto, String appId) {
+        final ResponseDTO responseDTO = new ResponseDTO();
+        final PackageExportDao dao = getDao(appId);
+        responseDTO.setData(BatchExportPackageUtils
+                .getDownloadBusinessLevelState(dao, dao.getMaxLevel(), dto));
+        return responseDTO;
+    }
+
+    @Override
+    public ResponseDTO getDownloadPackages(PackageExportDTO dto, String appId) {
+        init(appId, dto);
+        Page page = dto.getPage();
+        Integer rowStart = null == page.getRowStart() ? 1 : page.getRowStart();
+        Integer pageSize = page.getSize();
+        final PackageExportDao dao = getDao(appId);
+        List<PackageDownloadResponseDTO> finalReports =new ArrayList<>();
+        List<PackageDownloadResponseDTO> reports;
+        long recordCount = 0L;
+        boolean isEmpty = false;
+        while (finalReports.size() < pageSize && !isEmpty) {
+            dto.getPage().setRowStart(rowStart);
+            reports = dao.getPackageDownloads(dto, getDownloadAllColumns());
+            int size = reports.size();
+            isEmpty = size == 0;
+            if(recordCount == 0L){
+                recordCount = CollectionUtils.isEmpty(reports) ? 0L : reports.get(0).getRecordCount();
+            }
+            viewExportSubService.applySfwCheckForReports(reports, appId);
+            finalReports.addAll(reports);
+            recordCount = recordCount - (long) (size - reports.size());
+            rowStart = rowStart + pageSize;
+        }
+        BatchExportPackageUtils.setDownloadState(finalReports, dao);
+        final ResponseDTO responseDTO = new ResponseDTO();
+        responseDTO.setData(finalReports);
+        final Map<String, Object> meta = new HashMap<>();
+        meta.put(RECORDCOUNT, recordCount);
+        meta.put("rowStart", rowStart);
+        responseDTO.setMeta(meta);
+        return responseDTO;
+    }
+
+    @Override
+    public ResponseDTO getDownloadStatus(String appId,
+                                         List<Integer> exportIds) {
+        PackageExportDao dao = getDao(appId);
+        return new ResponseDTO(dao.getDownloadStatus(exportIds));
+    }
+
+    @Override
+    public ResponseDTO isPackageExportInProgress(String appId, Long pkgId) {
+        PackageExportDao dao = getDao(appId);
+        return new ResponseDTO(ImmutableMap.of("exportInProgress", dao.isPackageExportInProgress(pkgId)));
+    }
+
+    @Override
+    public ResponseDTO isCohortIdPrivate(String appId, Long pkgId) {
+        PackageExportDao dao = getDao(appId);
+        return new ResponseDTO(dao.getCohortFlagResponse(pkgId));
+    }
+
+    @Override
+    public String getToken(long id, String appId) {
+        return getDao(appId).getToken(id);
+    }
+
+    @Override
+    public int deletePackage(Long id, String appId) {
+        try {
+            final PackageExportDao dao = getDao(appId);
+            final URL url = new URL(getDeletePackageUrl(id));
+            final HttpURLConnection con = (HttpURLConnection) url
+                    .openConnection();
+            con.setRequestMethod("DELETE");
+            con.getResponseCode();
+            final int resCode = dao.deletePackage(id);
+            if (resCode == 1) {
+                dao.writePackageDeletedLog(id, cp.getUserId(),
+                        cp.getUserName());
+            }
+            return resCode;
+        } catch (Exception e) {
+            throw new DataServiceException("Error during package deleting",
+                    ErrorCodes.BATCH_EXPORT_PACKAGE_DELETE_FAILED);
+        }
+    }
+
+    @Override
+    public PackageResponseDTO savePackage(PackageExportDTO dto, String appId) {
+        PackageExportDao dao = getDao(appId);
+        init(appId, dto);
+        dto.setToken(cp.getTokenValue());
+        validateName(dto);
+        validateDuplicateName(dao, dto);
+        setDefaultValueIfEmpty(dto);
+        setAnalysisPeriod(dto);
+        setBusinessLevels(dto, appId);
+        LOGGER.debug(" Saved package {}  ", dto);
+        final PackageResponseDTO responseDTO = dao.savePackage(dto);
+        BatchExportPackageUtils.setIndividualState(responseDTO, dao);
+        return responseDTO;
+    }
+
+    @Override
+    public PackageResponseDTO updatePackage(PackageExportDTO dto, String appId,
+                                            String apiBasePath, String token) {
+        return doUpdate(dto, appId);
+    }
+
+    @Override
+    public PackageResponseDTO updateAndExportPackage(PackageExportDTO dto,
+                                                     String appId, String apiBasePath) {
+        PackageResponseDTO pkgResponseDto = doUpdate(dto, appId);
+        doExport(dto, appId, apiBasePath);
+        return pkgResponseDto;
+    }
+
+    private PackageResponseDTO doUpdate(PackageExportDTO dto, String appId) {
+        PackageExportDao dao = getDao(appId);
+        assertPackageId(dto.getPkgId());
+        init(appId, dto);
+        validateName(dto);
+        validateDuplicateName(dao, dto);
+        setDefaultValueIfEmpty(dto);
+        setAnalysisPeriod(dto);
+        setBusinessLevels(dto, appId);
+        PackageResponseDTO responseDTO = dao.updatePackage(dto, getNotificationDto(dto, dao));
+        BatchExportPackageUtils.setIndividualState(responseDTO, dao);
+        return responseDTO;
+    }
+
+    private List<NotificationDTO> getNotificationDto(PackageExportDTO dto, PackageExportDao dao) {
+        if (!dao.isSharedPackage(dto.getPkgId())) {
+            return Collections.emptyList();
+        }
+        final PackageResponseDTO responseDto = dao.getSharedPackageDetails(dto);
+        final NotificationDTO title = new NotificationDTO();
+        title.setPkgId(responseDto.getPkgId());
+        title.setAppId(responseDto.getAppId());
+        title.setKey(NotificationKeys.TITLE.name());
+        title.setBeforeValue(responseDto.getPkgName());
+        title.setAfterValue(dto.getPackageName());
+        final NotificationDTO format = new NotificationDTO();
+        format.setAppId(responseDto.getAppId());
+        format.setPkgId(responseDto.getPkgId());
+        format.setKey(NotificationKeys.FORMAT.name());
+        format.setBeforeValue(responseDto.getPkgFormat());
+        format.setAfterValue(null == dto.getFormat() ? null : dto.getFormat().name());
+        final NotificationDTO interval = new NotificationDTO();
+        interval.setAppId(responseDto.getAppId());
+        interval.setPkgId(responseDto.getPkgId());
+        interval.setKey(NotificationKeys.GEN_INTERVAL.name());
+        interval.setBeforeValue(responseDto.getGenInterval());
+        interval.setAfterValue(null == dto.getGenInterval() ? null : dto.getGenInterval().getLabel());
+        final NotificationDTO type = new NotificationDTO();
+        type.setAppId(responseDto.getAppId());
+        type.setPkgId(responseDto.getPkgId());
+        type.setKey(NotificationKeys.TYPE.name());
+        type.setBeforeValue(responseDto.getType());
+        type.setAfterValue(null == dto.getReportType() ? null : dto.getReportType().getLabel());
+        final NotificationDTO level = new NotificationDTO();
+        level.setAppId(responseDto.getAppId());
+        level.setPkgId(responseDto.getPkgId());
+        level.setKey(NotificationKeys.BUSINESS_LEVELS.name());
+        level.setBeforeValue(String.valueOf(getHashCode(responseDto.getExportLevels())));
+        level.setAfterValue(String.valueOf(getHashCode(dto.getExportLevels())));
+        final NotificationDTO timePeriod = new NotificationDTO();
+        timePeriod.setAppId(responseDto.getAppId());
+        timePeriod.setPkgId(responseDto.getPkgId());
+        timePeriod.setKey(NotificationKeys.TIME_PERIOD.name());
+        try {
+            final AnalysisPeriodDTO ap = BatchExportPackageUtils.getAnalysisPeriod(responseDto);
+            final boolean isApNull = (null == ap) || ((null == ap.getPeriod()) && CollectionUtils.isEmpty(ap.getArgs()) && (null == ap.getType())
+                    && (null == ap.getDefaultTrendPeriod()) && (null == ap.getPastMonths()) && (null == ap.getDateAnalysisBy()) && (null == ap.getTimePeriod()));
+            final ObjectMapper mapper = BatchExportPackageUtils.getExportMapper();
+            timePeriod.setBeforeValue(isApNull ? null : mapper.writeValueAsString(ap));
+            timePeriod.setAfterValue(null == dto.getAnalysisPeriod() ? null : mapper.writeValueAsString(dto.getAnalysisPeriod()));
+        } catch (JsonProcessingException e) {
+            throw new DataServiceException("Error occurred while parsing analysis period dto on package update.", INVALID_ANALYSIS_PERIOD);
+        }
+        return Arrays.asList(title, format, interval, type, level, timePeriod);
+    }
+
+    private int getHashCode(List<BatchExportBusinessLevelDTO> list) {
+        if (null == list) {
+            list = Collections.emptyList();
+        }
+        return Objects.hashCode(list);
+    }
+
+    private void doExport(PackageExportDTO dto, String appId,
+                          String apiBasePath) {
+
+        PackageExportOverrideService packageExportOverrideService = new PackageExportOverrideServiceImpl(
+                cbeTokenService, apiBasePath, dto, viewExportService, context,
+                 retryExecutor, batchExportErrorEmailSender);
+        List<ViewExportDTO> viewsToUpdate = packageExportOverrideService
+                .getViewsToUpdate();
+
+        if (CollectionUtils.isEmpty(viewsToUpdate)) {
+            throw new DataServiceException(
+                    "Cannot export package " + dto.getPackageName() + " "
+                            + "as it does not contain any view.",
+                    BATCH_EXPORT_VIEW_NOT_FOUND);
+
+        }
+
+        initExportPackage(dto, appId);
+        packageExportOverrideService.createPackageExecutionLogEntry();
+        LOGGER.info("Queued export job for package {} and export ID {}",packageExportOverrideService.getpackageExportDTO().getPackageName(),packageExportOverrideService.getpackageExportDTO().getExportId());
+        ExportJobRegistry.queue(packageExportOverrideService);
+        
+
+    }
+
+    private List<Map<Integer, LevelSelection<Integer>>> getSfwLevelMap(String appId,
+                                                              List<BatchExportBusinessLevelDTO> dtos, boolean isIndividual) {
+        if (CollectionUtils.isEmpty(dtos)) {
+            return new LinkedList<>() {{
+                add(new HashMap<>()); // adding an empty map making the list non-empty
+            }};
+        }
+        return convertListToMap(dtos,
+                context.getBean(BusinessLevelsDAO.class, appId), isIndividual);
+    }
+
+    private void initExportPackage(PackageExportDTO dto, String appId) {
+        init(appId, dto);
+        final UserMiscRights userMiscRights = cp.getMiscRights();
+        dto.setRealMemberId(userMiscRights.isRealMemberId());
+        dto.setDemographic(userMiscRights.isDemographic());
+        dto.setShowMemberName(userMiscRights.isShowMembername());
+        dto.setUseExcelColors(userMiscRights.isUseExcelColors());
+        dto.setClientId(
+                databaseConfigService.getUserAppsMap(appId).get(CLIENTID));
+        final Map<String, String> params = getValuesFromMap(
+                databaseConfigService.getFixedParamMap(),
+                Arrays.asList(DataExportConstant.ARMS_URL,
+                        DataExportConstant.ARMS_PASSWORD));
+        dto.setArmsUrl(params.get(DataExportConstant.ARMS_URL));
+        dto.setArmsPassword(params.get(DataExportConstant.ARMS_PASSWORD));
+        dto.setServiceId(
+                BatchExportPackageUtils.CUSTOM_BATCH_EXPORT_SERVICE_ID);
+        initExportAnalysisPeriod(dto);
+    }
+
+    private void initExportAnalysisPeriod(PackageExportDTO dto) {
+        if (Y != dto.getTimePeriodOverride()) {
+            return;
+        }
+        final AnalysisPeriodDTO period = dto.getAnalysisPeriod();
+        dto.setPeriod(period.getPeriod());
+    }
+
+    @Override
+    public Map<String, Column> getAllColumns() {
+        final Map<String, Column> columnMap = getCommonColumnMap();
+        columnMap.put("pkgscheduleddate",
+                new Column("pkgscheduleddate", SCHEDULE_DATE_LABEL,
+                        SCHEDULE_DATE_LABEL, true, true, ColTypes.DATE));
+        return columnMap;
+    }
+
+    @Override
+    public Map<String, Column> getDownloadAllColumns() {
+        final Map<String, Column> columnMap = getCommonColumnMap();
+        columnMap.put("scheduleddate",
+                new Column("scheduleddate", SCHEDULE_DATE_LABEL,
+                        SCHEDULE_DATE_LABEL, true, true, ColTypes.DATE));
+        columnMap.put("exportname", new Column("exportname", "Export Name",
+                "Export Name", true, true, ColTypes.STRING));
+        columnMap.put("processendtime", new Column("processendtime",
+                "Generated date", "Generated date", true, true, ColTypes.DATE));
+        columnMap.put("fullcycle", new Column("fullcycle", "Full Cycle",
+                "Full Cycle", true, true, ColTypes.STRING));
+        columnMap.put("pkgid", new Column("pkgid", "Package Id", "Package Id",
+                true, true, ColTypes.STRING));
+        return columnMap;
+    }
+
+    private Map<String, Column> getCommonColumnMap() {
+        final Map<String, Column> columnMap = new HashMap<>();
+        final Column name = new Column("pkgname", "Package Name",
+                "Package Name", true, true, ColTypes.STRING);
+        name.setIsdefault(true);
+        columnMap.put("pkgname", name);
+        columnMap.put("username", new Column("username", "Owner", "Owner", true,
+                true, ColTypes.STRING));
+        columnMap.put("createddate", new Column("createddate", "Created by",
+                "Created by", true, true, ColTypes.DATE));
+        columnMap.put("viewcount", new Column("viewcount", "Views", "Views",
+                true, true, ColTypes.INTEGER));
+        columnMap.put("pkgformat", new Column("pkgformat", "Format", "Format",
+                true, true, ColTypes.STRING));
+        columnMap.put("geninterval", new Column("geninterval", "Generation",
+                "Generation", true, true, ColTypes.STRING));
+        columnMap.put("pkgscope", new Column("pkgscope", "Visibility",
+                "Visibility", true, true, ColTypes.STRING));
+        columnMap.put("reporttype", new Column("reporttype", "Type", "Type",
+                true, true, ColTypes.STRING));
+        return columnMap;
+    }
+
+    @Override
+    @Transactional(rollbackFor = { RuntimeException.class }, propagation = Propagation.REQUIRES_NEW)
+    public PackageResponseDTO clonePackage(String appId, String apiBasePath,
+            PackageExportDTO dto) throws IOException {
+        final PackageExportDao dao = getDao(appId);
+        dto.setToken(cp.getTokenValue());
+        init(appId, dto);
+        LOGGER.info("User {} started to clone package {}.", dto.getUserId(), dto.getPkgId());
+        dto.setFilterScope(PackageExportDTO.FilterPackages.ALL);
+        assertPackageId(dto.getPkgId());
+        validateName(dto);
+        final Long pkgId = dto.getPkgId();
+        dto.setPkgId(null);
+        validateDuplicateName(dao, dto);
+        dao.updateUpdatedDate(pkgId);
+        dto.setPkgId(pkgId);
+        return dao.clonePackage(dto);
+    }
+
+    @Override
+    public void updateViewExportPackage(PackageResponseDTO response, String appId, Long pkgId ) {
+        final PackageExportDao dao = getDao(appId);
+        final List<ViewExportDTO> viewDetails = viewExportService.findClonedViewsByPkgId(response.getPkgId(), appId);
+        LOGGER.info("Extracted {} view details in package {}.", viewDetails.toArray().length, pkgId);
+        if (!CollectionUtils.isEmpty(viewDetails)) {
+            updateViewsFromExportPackage(response, appId, apiBasePath, viewDetails, dao);
+        }
+        BatchExportPackageUtils.setIndividualState(response, dao);
+    }
+    private void updateViewsFromExportPackage(PackageResponseDTO dto,
+            String appId, String apiBasePath, List<ViewExportDTO> viewDetails,
+            PackageExportDao dao) {
+        final BusinessLevelsDAO businessLevelsDAO = context.getBean(BusinessLevelsDAO.class, appId);
+        final ObjectMapper mapper = BatchExportPackageUtils.getExportMapper();
+
+        viewDetails.forEach(v -> {
+            JsonNode rootNode = null;
+            try {
+                rootNode = mapper.readTree(v.getRequestPayload());
+                final ArrayNode sheets = (ArrayNode) rootNode.get("sheets");
+                if (!viewExportService.hasFullAccess(appId)) {
+                        final List<BatchExportBusinessLevelDTO> dtos = viewExportService.proceedWithSfwLevels(appId, v.getId());
+                        final Map<Integer, LevelSelection<Integer> > nLevels;
+                        if (!CollectionUtils.isEmpty(dtos)) {
+                            nLevels = BatchExportPackageUtils.convertToMap(dtos, businessLevelsDAO, dao);
+                        } else {
+                            nLevels = new HashMap<>();
+                        }
+                        final String levelJsonStr = mapper.writeValueAsString(nLevels);
+                        BatchExportPackageUtils.updateFilterNode(rootNode, sheets, mapper.readTree(levelJsonStr), BUSINESS_LEVELS_KEY);
+                }
+                final ObjectNode export = (ObjectNode) rootNode.get("viewExport");
+                export.put("id", v.getId());
+                LOGGER.info("Updating view {} to insert in new package {}.", v.getId(), dto.getPkgId());
+                removeOthersCohorts(v,mapper,appId, rootNode, sheets, export);
+                final TextNode memberQueryNode = BatchExportPackageUtils.getMemberQueryNode(rootNode);
+                if (null != memberQueryNode) {
+                    final String oldId = memberQueryNode.asText().trim();
+                    final String newId = dao.updateSubQuery(oldId, true);
+                    export.put(PAGE_STATE_KEY, export.get(PAGE_STATE_KEY).asText().replace(oldId, newId));
+                    ((ObjectNode) rootNode).put("memberQueryId", newId);
+                    export.put("subQueryId", newId);
+                }
+                final TextNode claimQueryNode = BatchExportPackageUtils.getClaimQueryNode(rootNode);
+                if (null != claimQueryNode) {
+                    final String oldId = claimQueryNode.asText().trim();
+                    final String newId = dao.updateSubQuery(oldId, false);
+                    export.put(PAGE_STATE_KEY, export.get(PAGE_STATE_KEY).asText().replace(oldId, newId));
+                    ((ObjectNode) rootNode).put("claimQueryId", newId);
+                    export.put("subQueryId", newId);
+                }
+                if (!cp.getMiscRights().isHasPHIAccess() ) {
+                    boolean isViewWithClaimSummary = BatchExportPackageUtils.isViewsWithClaimSummary(v, mapper);
+                    if (isViewWithClaimSummary) {
+                        JsonNode payloadForClaimSummary = BatchExportPackageUtils.constructRequestPayloadForClaimSummary(rootNode.deepCopy());
+                        ResponseEntity<ResponseDTO> response = getClaimSummary(appId, v, payloadForClaimSummary );
+
+                        Map<String, Object> metaData = response.getBody().getMeta();
+                        Map<String, Object> sumMetaData = (Map) metaData.get("sum");
+                        JsonNode exportFormatNode = rootNode.get("exportFormat");
+                        ObjectNode tableFooterParamsNode = (ObjectNode) exportFormatNode.get("tableFooterParams");
+                        sumMetaData.keySet().forEach( key -> {
+                            if(null != sumMetaData.get(key)) {
+                                tableFooterParamsNode.put(key, sumMetaData.get(key).toString());
+                            }
+                        });
+                        MapSqlParameterSource paramMap = new MapSqlParameterSource();
+                        paramMap.addValue("requestPayload", mapper.writeValueAsString(rootNode));
+                        paramMap.addValue("viewId", v.getId());
+                        dao.updateViewsForSummary(paramMap);
+                    }
+                }
+
+                export.put("pkgId", dto.getPkgId());
+                export.put("overrideRequest", true);
+                export.put("individualReport", false);
+                BatchExportPackageUtils.cleanUpViewExportNodeIfNeeded(rootNode);
+                LOGGER.info("View {} of package {} being exported to app {} through url {}.", v.getId(), dto.getPkgId(), appId, v.getApiEndpoint());
+                retryExecutor.execute(appId, v.getApiEndpoint(), rootNode.toString(), BatchExportPackageUtils.getHttpHeaders(""), apiBasePath, true);
+            } catch (JsonProcessingException | RuntimeException e) {
+                dao.deletePackage(dto.getPkgId());
+                LOGGER.error("Sending error email to client support and user: {} for viewId: {}", dto.getUserId(), v.getId());
+                batchExportErrorEmailSender.sendEmailOnError(appId, rootNode != null ? rootNode.toString() : null, e.getMessage());
+
+                LOGGER.info("Error while updating view {} of package {}.", v.getId(), dto.getPkgId());
+                LOGGER.error("Error during view parsing", e);
+                throw new DataServiceException("Error during view parsing ", ErrorCodes.BATCH_EXPORT_VIEW_UPDATE_FAILED);
+            }
+        });
+
+    }
+
+    private ResponseEntity<ResponseDTO> getClaimSummary(String appId, ViewExportDTO viewExportDTO, JsonNode jsonNode) {
+        return retryExecutor.execute(appId, viewExportDTO.getApiEndpoint(), jsonNode.toString(), BatchExportPackageUtils.getHttpHeaders(""), apiBasePath, false);
+    }
+
+    
+    
+	public void removeOthersCohorts(ViewExportDTO v, ObjectMapper mapper, String appId, JsonNode rootNode,
+			ArrayNode sheets, ObjectNode export) throws JsonProcessingException {
+
+		List<String> popAnalyzerForms = BatchExportViewUtils.POPULATION_ANALYZER_FORMIDS;
+		String formId = BatchExportViewUtils.getApplicableFormIdForView(v);
+		if (!popAnalyzerForms.contains(formId)) {
+			removeCohortOfOtherUser(appId, rootNode, sheets, export);
+			if (FormIdConstant.MX_ED.equals(formId)) {
+				removeSecondCohortOfOtherUser(appId, rootNode, sheets, export);
+			}
+			return;
+		}
+
+		String userId = cp.getUserId();
+		CohortDAO cohortDAO = context.getBean(CohortDAO.class, appId);
+		List<Integer> allowedCohortIds = new ArrayList<>();
+
+		List<Integer> cohortIds = getPopulationAnalyzerCohortIds(mapper, v.getRequestPayload());
+		List<CohortDTO> cohortsToUse = cohortDAO.getCohortDetails(cohortIds, appId);
+
+		Predicate<CohortDTO> inAccessobleCohortPred = e -> !e.getOwnerUserId().equals(userId)
+				&& (CohortParameters.Scope.PRIVATE == e.getScope() || (null != e.getState() &&  !e.getState().getBusinessLevels().isEmpty()
+						&& !viewExportService.hasSameSfwAccessOnCohort(appId, e.getState().getBusinessLevels())));
+
+		if (cohortsToUse != null && !cohortsToUse.isEmpty()) {
+			cohortsToUse.removeIf(inAccessobleCohortPred);
+			allowedCohortIds = cohortsToUse.stream().map(CohortDTO::getId).collect(Collectors.toList());
+		}
+
+		JsonNode cohortIdsReplacementNode = mapper.readTree(mapper.writeValueAsString(allowedCohortIds));
+		((ObjectNode) rootNode).replace("cohortIds", cohortIdsReplacementNode);
+
+	}
+
+	private void removeCohortOfOtherUser(String appId, JsonNode rootNode, ArrayNode sheets, ObjectNode export)
+			throws JsonProcessingException {
+		int cohortId = BatchExportPackageUtils.getCohortId(rootNode, sheets);
+		if (cohortId != -1 && this.isCohortInvalid(appId, cohortId)) {
+			BatchExportPackageUtils.removeCohortNode(rootNode, sheets);
+            LOGGER.info("Removed invalid cohort {}.", cohortId);
+			BatchExportPackageUtils.removeFromPageFilter(export, BatchExportPackageUtils.COHORT_KEY);
+		}
+	}
+
+	private void removeSecondCohortOfOtherUser(String appId, JsonNode rootNode, ArrayNode sheets, ObjectNode exportNode)
+			throws JsonProcessingException {
+		int secondCohortId = BatchExportPackageUtils.getSecondCohortId(rootNode);
+		if (secondCohortId != -1) {
+			boolean hasFirstCohort = BatchExportPackageUtils.getCohortId(rootNode, sheets) != -1;
+			boolean isSecondCohortValid = !this.isCohortInvalid(appId, secondCohortId);
+			if (!hasFirstCohort && isSecondCohortValid) {
+				BatchExportPackageUtils.moveSecondCohortToFirstForED(rootNode, exportNode);
+			}
+			if (!hasFirstCohort || !isSecondCohortValid) {
+				BatchExportPackageUtils.removeSecondCohortNode(rootNode);
+				BatchExportPackageUtils.removeFromPageFilter(exportNode, BatchExportPackageUtils.SECOND_COHORT_KEY);
+			}
+		}
+	}
+
+	private boolean isCohortInvalid(String appId, int cohortId) {
+		boolean isCohortInvalid = false;
+		final CohortDAO cohortDAO = context.getBean(CohortDAO.class, appId);
+		CohortDTO cohortDTO;
+		try {
+			cohortDTO = cohortDAO.getCohortDetails(cohortId, appId);
+            LOGGER.info("Extracted cohort {} having scope of {}. ", cohortDTO.getId(), cohortDTO.getScope());
+			boolean isOwnCohort = cp.getUserId().equalsIgnoreCase(cohortDTO.getOwnerUserId());
+			if (!isOwnCohort) {
+				final boolean isPrivateCohort = CohortParameters.Scope.PRIVATE == cohortDTO.getScope();
+				final FiltersDTO cohortFilters = cohortDTO.getState();
+				if (isPrivateCohort || (cohortFilters != null
+						&& !viewExportSubService.hasSameSfwAccessOnCohort(appId, cohortFilters.getBusinessLevels()))) {
+					isCohortInvalid = true;
+				}
+			}
+		} catch (DataServiceException e) {
+			if (e.getIErrorCode().getCode().intValue() == ErrorCodes.INVALID_COHORT.getCode().intValue()) {
+				isCohortInvalid = true;
+			} else {
+				throw new DataServiceException("Error occurred on retrieving cohort details", e,
+						ErrorCodes.BATCH_EXPORT_VIEW_UPDATE_FAILED);
+			}
+		}
+		return isCohortInvalid;
+	}
+
+    private List<Map<Integer, LevelSelection<Integer> >> convertListToMap(
+            List<BatchExportBusinessLevelDTO> dtoList,
+            BusinessLevelsDAO businessLevelsDAO, boolean isIndividual) {
+        final List<Map<Integer, LevelSelection<Integer> >> list = new LinkedList<>();
+        final int maxLevel = businessLevelsDAO.getMaxLevel();
+        BatchExportPackageUtils.getLevelMap(dtoList, maxLevel, isIndividual)
+                .forEach(map -> {
+                    final Map<Integer, LevelSelection<Integer> > levels = businessLevelsDAO
+                            .convertVarBusinessLvlToNumericLvl(map);
+                    levels.values().removeIf(
+                            l -> CollectionUtils.isEmpty(l.getExclude())
+                                    && CollectionUtils.isEmpty(l.getInclude()));
+                    list.add(levels);
+                });
+        return list;
+    }
+
+    private void init(String appId, PackageExportDTO dto) {
+        dto.setAppId(appId);
+        dto.setUserId(cp.getUserId());
+    }
+
+    private void validateName(PackageExportDTO dto) {
+        if (!StringUtils.hasLength(dto.getPackageName())) {
+            throw new DataServiceException("Please provide the package name.",
+                    INVALID_PAYLOAD);
+        }
+    }
+
+    private void validateDuplicateName(PackageExportDao dao,
+            PackageExportDTO dto) {
+        if (dao.isDuplicatePackageName(dto)) {
+            throw new DataServiceException(
+                    "You already have a package with same name. Please try another name",
+                    BATCH_EXPORT_PACKAGE_NAME_ALREADY_EXISTS);
+        }
+    }
+
+    private void setBusinessLevels(PackageExportDTO dto, String appId) {
+        final List<Map<Integer, LevelSelection>> bLevelList = dto
+                .getBusinessLevels();
+
+        boolean isBLevelListEmpty = CollectionUtils.isEmpty(bLevelList);
+        boolean isOverrideNotMatching = Y != dto.getnKeyOverride();
+
+        if ((dto.getReportType() == INDIVIDUAL && N == dto.getnKeyOverride() && isBLevelListEmpty) ||
+            (dto.getReportType() != INDIVIDUAL && (isBLevelListEmpty || isOverrideNotMatching))) {
+            return;
+        }
+
+        final List<BatchExportBusinessLevelDTO> levelList = new LinkedList<>();
+        setBusinessLevelsAsPerReportType(dto, appId, bLevelList, levelList);
+        dto.setExportLevels(levelList);
+    }
+
+    private void setBusinessLevelsAsPerReportType(PackageExportDTO dto,
+            String appId, List<Map<Integer, LevelSelection>> bLevelList,
+            List<BatchExportBusinessLevelDTO> levelList) {
+        if (dto.getReportType() == INDIVIDUAL) {
+            BatchExportPackageUtils.setIndividualLevelsList(context, appId,
+                    bLevelList, levelList);
+        } else {
+            BatchExportPackageUtils.setAggregateLevelsList(context, appId,
+                    bLevelList, levelList);
+        }
+    }
+
+    private void assertPackageId(Long pkgId) {
+        Assert.state(((null != pkgId) && (pkgId > 0)),
+                "Package id should be a valid number.");
+    }
+
+    private void setDefaultValueIfEmpty(PackageExportDTO dto) {
+        if (null == dto.getGenInterval()) {
+            dto.setGenInterval(PackageExportDTO.GenInterval.ON_DEMAND);
+        }
+        if (null == dto.getReportType()) {
+            dto.setReportType(PackageExportDTO.ReportType.AD_HOC);
+        }
+        if (null == dto.getStatus()) {
+            dto.setStatus(PackageExportDTO.Status.ACTIVE);
+        }
+        if (null == dto.getTimePeriodOverride()) {
+            dto.setTimePeriodOverride(N);
+        }
+        if (null == dto.getnKeyOverride()) {
+            dto.setnKeyOverride(N);
+        }
+        if (null == dto.getFilterScope()) {
+            dto.setFilterScope(PackageExportDTO.FilterPackages.ALL);
+        }
+    }
+
+    private void setAnalysisPeriod(PackageExportDTO dto) {
+        if (Y != dto.getTimePeriodOverride()) {
+            return;
+        }
+        final AnalysisPeriodDTO period = dto.getAnalysisPeriod();
+        dto.setPeriod(period.getPeriod());
+        dto.setLastMonths(period.getPastMonths());
+        dto.setAnalysisBy(period.getType());
+        dto.setTimePeriod(BatchExportPackageUtils.getTimePeriod(period));
+    }
+
+    @Override
+    public int deleteReport(Long exportId, String appId) throws IOException {
+        URL url = new URL(getDeleteUrl(exportId));
+        HttpURLConnection con = (HttpURLConnection) url.openConnection();
+        con.setRequestMethod("DELETE");
+        final int responseCode = con.getResponseCode();
+        if (responseCode == OK.value()) {
+            getDao(appId).writeReportDeletedLog(exportId, cp.getUserId(),
+                    cp.getUserName());
+        }
+        return responseCode;
+    }
+
+    private String getDeleteUrl(Long exportId) {
+        final D2Encoder encoder = new D2Encoder();
+        final String url = databaseConfigService.getFixedParamMap()
+                .get(FIXED_PARAMS_CBE_URL_KEY) + "/delete-report";
+        return String.format("%s/%d?name=%s&password=%s", url, exportId,
+                encoder.encode(databaseConfigService.getFixedParamMap()
+                        .get(FIXED_PARAMS_CBE_USER_KEY)),
+                encoder.encode(databaseConfigService.getFixedParamMap()
+                        .get(FIXED_PARAMS_CBE_PASS_WORD_KEY)));
+    }
+
+    private PackageExportDao getDao(String appId) {
+        return context.getBean(PackageExportDao.class, appId);
+    }
+
+    private String getDeletePackageUrl(Long packageId) {
+        final D2Encoder encoder = new D2Encoder();
+        final String url = databaseConfigService.getFixedParamMap()
+                .get(FIXED_PARAMS_CBE_URL_KEY) + "/delete-package";
+        return String.format("%s/%d?name=%s&password=%s", url, packageId,
+                encoder.encode(databaseConfigService.getFixedParamMap()
+                        .get(FIXED_PARAMS_CBE_USER_KEY)),
+                encoder.encode(databaseConfigService.getFixedParamMap()
+                        .get(FIXED_PARAMS_CBE_PASS_WORD_KEY)));
+    }
+
+    public void exportPackage(PackageExportDTO requestedPkgDto) {
+        final String appId = requestedPkgDto.getAppId();
+        final PackageExportDao dao = getDao(appId);
+        if(requestedPkgDto.isPosting()) {
+            dao.updatedPOPDatesInContractYear(appId, requestedPkgDto.getPkgId());
+        }
+        PackageExportDTO pkgDtoDetail = dao.getPackageDetail(requestedPkgDto);
+        pkgDtoDetail.setExportId(requestedPkgDto.getExportId());
+        final boolean hasFullAccess = dao.getSFWTableName(pkgDtoDetail.getUserId())
+                .isEmpty();
+        if (Y == pkgDtoDetail.getnKeyOverride() && hasFullAccess) {
+        	List<Map<Integer, LevelSelection<Integer>>> intBLvlMapList= getSfwLevelMap(appId, pkgDtoDetail.getExportLevels(),
+                     INDIVIDUAL == pkgDtoDetail.getReportType());
+        	List<Map<Integer, LevelSelection>> raBLvlMapList =  intBLvlMapList.stream().map(e -> BatchExportPackageUtils.convertIntToRawMap(e)).collect(Collectors.toList());
+
+            pkgDtoDetail.setBusinessLevels(raBLvlMapList);
+        } else if (Y == pkgDtoDetail.getnKeyOverride() && !hasFullAccess) {
+            final List<BatchExportBusinessLevelDTO> sfwLevels = dao
+                    .getPersistedSfwLevels(pkgDtoDetail.getPkgId());
+
+            List<Map<Integer, LevelSelection<Integer>>> intBLvlMapList = getSfwLevelMap(appId, sfwLevels,
+                    INDIVIDUAL == pkgDtoDetail.getReportType());
+
+            List<Map<Integer, LevelSelection>> raBLvlMapList =  intBLvlMapList.stream().map(BatchExportPackageUtils::convertIntToRawMap).collect(Collectors.toList());
+            pkgDtoDetail.setBusinessLevels(raBLvlMapList);
+        }
+
+        doExport(pkgDtoDetail, appId, apiBasePath);
+    }
+
+
+
+
+    public List<PackageExportDTO> recurringReportList(String appId) {
+        return getDao(appId).getRecurringPkgDetails(appId);
+    }
+
+    @Override
+    public int enableDisablePackage(PackageExportDTO dto, String appId) {
+        return getDao(appId).enableDisablePackage(dto);
+    }
+    
+
+}
+
+
+
+
+this is the retry endpoint executor
+package com.verscend.mx.applicationservice.services.batchexport.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mi.dataservice.dataservicesecurity.security.CredentialProvider;
+import com.verscend.mx.applicationservice.services.batchexport.utils.BatchExportPackageUtils;
+import com.verscend.mx.applicationservice.services.email.EmailContentBuilder;
+import com.verscend.mx.applicationservice.services.util.CBETokenService;
+import com.vh.dashboard.dataprovider.dto.ResponseDTO;
+import com.vh.dashboard.dataprovider.exceptions.DataServiceException;
+import com.vh.dashboard.dataprovider.exceptions.ErrorCodes;
+import com.vh.dashboard.dataprovider.service.ViewExportService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
+import org.springframework.retry.RetryCallback;
+import org.springframework.retry.RetryContext;
+import org.springframework.retry.support.RetryTemplate;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+/**
+ *
+ * @author I68052
+ *
+ */
+@Service
+public class RetryEndpointExecutorImpl implements RetryEndpointExecutor {
+
+	@Autowired
+	private RetryTemplate retryTemplate;
+
+	@Autowired
+	private ViewExportService viewExportService;
+
+	@Autowired
+	@Qualifier("heuserTemplate")
+	protected NamedParameterJdbcTemplate heuserTemplate;
+
+	@Autowired
+	EmailContentBuilder emailContentBuilder;
+
+	@Autowired
+	private CBETokenService cbeTokenService;
+
+	@Autowired
+	private CredentialProvider credentialProvider;
+
+	private static final Logger LOGGER = LoggerFactory.getLogger(RetryEndpointExecutorImpl.class);
+
+	public String getValidToken(HttpHeaders headers, RetryContext context, String appId) {
+		String token;
+		if (headers != null && headers.containsKey("Authorization")) {
+			String headerToken = headers.getFirst("Authorization");
+			if (headerToken != null && !cbeTokenService.hasTokenExpired(headerToken.replace("Bearer ", "").trim())) {
+				return headerToken.replace("Bearer ", "").trim();
+			}
+		}
+
+		if (context != null) {
+			String contextToken = (String) context.getAttribute("newToken");
+			if (contextToken != null && !cbeTokenService.hasTokenExpired(contextToken)) {
+				return contextToken;
+			}
+		}
+
+		token = cbeTokenService.getUpdatedToken (appId, credentialProvider.getUserId());
+		if (token != null && context != null) {
+			context.setAttribute("newToken", token);
+		}
+
+		return token;
+	}
+
+
+	@Override
+	public ResponseEntity<ResponseDTO> execute(String appId, String apiEndPoint, String requestPayload,
+			HttpHeaders headers, String apiBasePath, boolean isCloneRequest) {
+		ApiEndPointCallBack callBack = new ApiEndPointCallBack(appId, apiEndPoint, requestPayload, headers,
+				apiBasePath);
+		ResponseEntity<ResponseDTO> response = null;
+		Exception retryException = null;
+		DataServiceException dse = null;
+		try {
+			response = retryTemplate.execute(context -> {
+				context.setAttribute("appId", appId);
+				context.setAttribute("userId", credentialProvider.getUserId());
+				String	validToken = getValidToken(headers, context, appId);
+				headers.setBearerAuth(validToken);
+				return callBack.doWithRetry(context);
+			});
+		}
+		catch (Exception th) {
+			retryException = th;
+
+		} finally {
+			boolean erroredOut = retryException != null || (response != null && response.getStatusCode() != HttpStatus.OK)
+					|| (response != null && response.getBody() != null && response.getBody().getErrors() != null
+					&& !response.getBody().getErrors().isEmpty());
+			if (erroredOut && !isCloneRequest) {
+				String url = callBack.getUrl();
+
+				if (response != null && response.getBody() != null && response.getBody().getErrors() !=null) {
+					final ObjectMapper objectMapper = BatchExportPackageUtils.getExportMapper();
+                    String errorMsg;
+                    try {
+                        errorMsg = objectMapper.writeValueAsString(response.getBody().getErrors());
+                    } catch (JsonProcessingException e) {
+						LOGGER.error("Error while parsing response: {}", e.getMessage());
+						errorMsg = e.getMessage();
+					}
+                    dse = new DataServiceException(errorMsg, ErrorCodes.INTERNAL_SERVER_ERROR);
+				} else if (retryException != null) {
+					LOGGER.error("Unsuccessful {} attempts to url {}. Giving up.",
+							callBack.getRetryContext().getRetryCount(), url, retryException);
+					dse = new DataServiceException("Call to endpoint:  " + url + " failed. " + retryException.getMessage() , retryException,
+							ErrorCodes.INTERNAL_SERVER_ERROR);
+				} else {
+					LOGGER.error("Error response {} received on {} attempts to url {}.", response.getStatusCode(),
+							callBack.getRetryContext().getRetryCount(), url);
+					dse = new DataServiceException(
+							"Call to endpoint:  " + url + "failed with response code " + response.getStatusCode(),
+							ErrorCodes.INTERNAL_SERVER_ERROR);
+				}
+			}
+		}
+		if(dse != null) {
+			throw dse;
+		}
+		return response;
+	}
+
+
+	private class ApiEndPointCallBack implements RetryCallback<ResponseEntity<ResponseDTO>, Exception> {
+		private final String appId;
+		private final String apiEndPoint;
+		private final String requestPayload;
+		private final HttpHeaders headers;
+		private final String apiBasePath;
+		private RetryContext context;
+		private final String url;
+
+		private ApiEndPointCallBack(String appId, String apiEndPoint, String requestPayload, HttpHeaders headers,
+				String apiBasePath) {
+			this.appId = appId;
+			this.apiEndPoint = apiEndPoint;
+			this.requestPayload = requestPayload;
+			this.headers = headers;
+			this.apiBasePath = apiBasePath;
+			this.url = apiBasePath + apiEndPoint + "?appId=" + appId;
+		}
+
+		@Override
+		public ResponseEntity<ResponseDTO> doWithRetry(RetryContext context) throws Exception {
+			this.context = context;
+			String viewId = BatchExportPackageUtils.getViewId(requestPayload);
+			boolean isIndividualReportType = BatchExportPackageUtils.isIndividualType(requestPayload);
+			if(isIndividualReportType) {
+				List<String> businessLevels = BatchExportPackageUtils.getBusinessLevelsKey(requestPayload);
+				String businessLvlCombination = BatchExportPackageUtils.getBusinessLvlCombination(requestPayload, businessLevels);
+				LOGGER.info("Attempt {} to url {}, for viewId:{}, {}", context.getRetryCount() + 1, url, viewId, businessLvlCombination);
+			} else {
+				LOGGER.info("Attempt {} to url {}, for viewId:{}", context.getRetryCount() + 1, url, viewId);
+			}
+			return viewExportService.exchange(appId, apiEndPoint, requestPayload, headers, apiBasePath);
+		}
+
+		private RetryContext getRetryContext() {
+			return this.context;
+		}
+
+		public String getUrl() {
+			return url;
+		}
+
+	}
+
+}
+
+
+
+So from this: return viewExportService.exchange(appId, apiEndPoint, requestPayload, headers, apiBasePath);
+the payload is being used in the following codes:
+
+This is the controller:
+
+@RestController
+@RequestMapping("/members")
+public class MembersController implements PHIController {
+
+    private static final String CLAIM_DETAIL_REGEX = "[^\\w,. ~#$%+()\\[\\]\\-]";
+
+    @Autowired
+    MembersService membersService;
+
+    @Autowired
+    private CredentialProvider credentialProvider;
+
+    @PostMapping
+    public ResponseEntity<ResponseDTO> getMembers(
+            @RequestParam("appId") String appId,
+            @Valid @RequestBody MemberRequestParameters requestParameters) {
+        return new ResponseEntity<>(
+                membersService.getMembers(requestParameters, appId),
+                HttpStatus.OK);
+    }
+
+this is the service implementation:
+package com.verscend.mx.memberservice.services.members;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+import com.mi.dataservice.dataservicesecurity.security.CredentialProvider;
+import com.verscend.mx.memberservice.dto.IndvLetterGenerationRequestParams;
+import com.verscend.mx.memberservice.dto.MemberRequestParameters;
+import com.verscend.mx.memberservice.services.cohort.dao.UDFDAO;
+import com.verscend.mx.memberservice.services.cohort.dto.UdfDto;
+import com.verscend.mx.memberservice.services.individualdashboard.indvclaimdetail.IndvClaimDetailService;
+import com.verscend.mx.memberservice.services.individualdashboard.indvclaimdetail.IndvClaimDetailsRequestParameter;
+import com.verscend.mx.memberservice.utils.ClaimDetailUtil;
+import com.verscend.mx.memberservice.utils.MembersServiceUtils;
+import com.vh.common.UserMiscRights;
+import com.vh.dashboard.dataprovider.branding.BrandingService;
+import com.vh.dashboard.dataprovider.common.IDataService;
+import com.vh.dashboard.dataprovider.components.AppConfigurations;
+import com.vh.dashboard.dataprovider.components.ClientParams;
+import com.vh.dashboard.dataprovider.components.DatabaseConfigService;
+import com.vh.dashboard.dataprovider.components.dxcg.DXCGBean;
+import com.vh.dashboard.dataprovider.components.dxcg.DXCGModel;
+import com.vh.dashboard.dataprovider.components.dxcg.DXCGModelInfoDAO;
+import com.vh.dashboard.dataprovider.components.dxcg.DXCGService;
+import com.vh.dashboard.dataprovider.components.dxcg.DxCGUtil;
+import com.vh.dashboard.dataprovider.components.dxcg.PopulationRiskDriverUtils;
+import com.vh.dashboard.dataprovider.constants.AlignTypes;
+import com.vh.dashboard.dataprovider.constants.CategoryTypes;
+import com.vh.dashboard.dataprovider.constants.ColTypes;
+import com.vh.dashboard.dataprovider.constants.FieldsConstant;
+import com.vh.dashboard.dataprovider.constants.Operator;
+import com.vh.dashboard.dataprovider.constants.PhiTypes;
+import com.vh.dashboard.dataprovider.dto.AnalysisPeriodDTO;
+import com.vh.dashboard.dataprovider.dto.AnalysisPeriodDTO.Period;
+import com.vh.dashboard.dataprovider.dto.ColumnFilter;
+import com.vh.dashboard.dataprovider.dto.ErrorDTO;
+import com.vh.dashboard.dataprovider.dto.ExportDTO;
+import com.vh.dashboard.dataprovider.dto.FiltersDTO;
+import com.vh.dashboard.dataprovider.dto.QueryAndParamsDTO;
+import com.vh.dashboard.dataprovider.dto.ResponseDTO;
+import com.vh.dashboard.dataprovider.dto.Sort;
+import com.vh.dashboard.dataprovider.dto.ViewExportDTO;
+import com.vh.dashboard.dataprovider.exceptions.DataServiceException;
+import com.vh.dashboard.dataprovider.exceptions.ErrorCodes;
+import com.vh.dashboard.dataprovider.favsdoh.SavedFavSdohDAO;
+import com.vh.dashboard.dataprovider.favsdoh.SavedFavSdohEntries;
+import com.vh.dashboard.dataprovider.model.Category;
+import com.vh.dashboard.dataprovider.model.Column;
+import com.vh.dashboard.dataprovider.model.ExcelOrCsv;
+import com.vh.dashboard.dataprovider.sendtooutbox.dao.SendToOutBoxDao;
+import com.vh.dashboard.dataprovider.sendtooutbox.models.SendToOutBoxRequestParams;
+import com.vh.dashboard.dataprovider.service.ColumnService;
+import com.vh.dashboard.dataprovider.service.DataExportService;
+import com.vh.dashboard.dataprovider.service.ViewExportService;
+import com.vh.dashboard.dataprovider.util.BatchExportUtil;
+import com.vh.dashboard.dataprovider.util.Cloner;
+import com.vh.dashboard.dataprovider.util.DataServiceUtil;
+import com.vh.dashboard.dataprovider.util.FilterUtil;
+import com.vh.dashboard.dataprovider.util.RequestParameterUtil;
+import com.vh.dashboard.dataprovider.util.ThreadUtils;
+import com.vh.dashboard.dataprovider.util.VersionControlUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.annotation.Scope;
+import org.springframework.jdbc.BadSqlGrammarException;
+import org.springframework.stereotype.Service;
+import org.springframework.util.CollectionUtils;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import static com.verscend.mx.memberservice.services.members.MemberColumns.BOB_PRED_ALLOWED_FULL_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.BOB_PRED_ALLOWED_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.BOB_PRED_ALLOWED_PARTIAL_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.BOB_RISK_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.BOOK_OF_BUSINESS_SYMBOL;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.DESCRIPTION;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.DISEASE_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.LABEL;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.LOED_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.LOH_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.MARKET_SCAN_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.MARKET_SCAN_SYMBOL;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.MODEL_NO;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.NAME;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.PREDICTIVE_COST_FULL_SYMBOL;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.PREDICTIVE_COST_PARTIAL_SYMBOL;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.RISK_DRIVE_COST_ALLOWED_AMOUNT_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.RISK_DRIVE_COST_RISK_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.RISK_DRIVE_LOED_ID;
+import static com.verscend.mx.memberservice.services.members.MemberColumns.RISK_DRIVE_LOH_ID;
+import static com.vh.dashboard.dataprovider.constants.AppConstants.MEMBERCOUNT;
+import static com.vh.dashboard.dataprovider.constants.AppConstants.OFFSET;
+import static com.vh.dashboard.dataprovider.constants.AppConstants.RECORDCOUNT;
+import static com.vh.dashboard.dataprovider.dto.ColumnFilter.ColumnFilterType.OPERAND;
+import static com.vh.dashboard.dataprovider.exceptions.ErrorCodes.INTERNAL_SERVER_ERROR;
+
+/**
+ * Created by amitpokhrel on 3/22/2018.
+ */
+@Service
+@Scope("prototype")
+public class MembersService implements IDataService {
+
+    private static final String FORM_ID = "MX_I301_INDV";
+    private static final String MEMID = "memid";
+    private static final String ASM = "ASM";
+    private static final List<String> FINANCIAL_DENIED_COLS = Arrays
+            .asList("totbilledamt", "totallowedamt", "medpaidamt","hrapaidamt",
+                    "hraallowedamt","rxpaidamt", "totpaidamt", "copayamt", "coinsamt",
+                    "deductamt", "medexpend1", "rxexpend1", "totalexpend1",
+                    "cardio_resp_arr_riskdrivepredallamt",
+                    "cardiovascular_riskdrivepredallamt",
+                    "cerebrovascular_riskdrivepredallamt",
+                    "diabetes_riskdrivepredallamt",
+                    "musculoskeletal_conn_tiss_riskdrivepredallamt",
+                    "pulmonary_riskdrivepredallamt",
+                    "substance_abuse_riskdrivepredallamt",
+                    "totempmedpaidamt",
+                    "totemprxpaidamt",
+                    "totemppaidamt");
+
+    private static final List<String> DXCG_DENIED_COLS = Arrays.asList("medexpend1", "rxexpend1", "totalexpend1");
+    private static final Logger LOGGER = LoggerFactory
+            .getLogger(MembersService.class);
+    public static final String MEM_NAME_COL = "memname";
+
+    @Autowired
+    private ApplicationContext context;
+
+    @Autowired
+    ColumnService columnService;
+
+    @Autowired
+    private CredentialProvider credentialProvider;
+
+    @Autowired
+    DXCGService dxcgService;
+
+    @Autowired
+    DxCGUtil dxCGUtil;
+
+    @Autowired
+    private BrandingService brandingService;
+
+    @Autowired
+    private DataExportService dataExportService;
+
+    @Autowired
+    private IndvClaimDetailService indvClaimDetailService;
+
+    @Autowired
+    private DatabaseConfigService databaseConfigService;
+
+    @Autowired
+    private AppConfigurations appConfigurations;
+
+    @Autowired
+    private ViewExportService viewExportService;
+
+    public ResponseDTO getMembers(MemberRequestParameters requestParameter,
+                                  String appId) {
+        final UserMiscRights miscRights = credentialProvider.getMiscRights();
+        final IMembersDAO membersDAO = getMembersDAO(appId);
+        final Map<String, Column> columnMap = getAllColumns(appId);
+        if (null != requestParameter.getExportFormat()) {
+            requestParameter.setEncodingApplied(isEncodingApplied(membersDAO));
+            final MemberRequestParameters cloneParameters = Cloner
+                    .cloneThis(requestParameter);
+            setRequestPayload(cloneParameters, appId, membersDAO, columnMap, miscRights);
+            cloneParameters.setColumns(
+                    getValidColumns(miscRights, cloneParameters.getColumns(),
+                            appId));
+            applyMiscRights(miscRights, columnMap, appId);
+            final ExcelOrCsv<MemberRequestParameters> excelOrCsv = getExcelOrCsv(
+                    appId, cloneParameters, columnMap, miscRights,
+                    membersDAO);
+            excelOrCsv.setApiEndPoint("/members");
+            return dataExportService.generateSingleSheetExcelOrCsv(excelOrCsv);
+        } else {
+            requestParameter.setColumns(
+                    getValidColumns(miscRights, requestParameter.getColumns(),
+                            appId));
+            applyMiscRights(miscRights, columnMap, appId);
+            final List<Map<String, Object>> data = membersDAO
+                    .getMembersData(requestParameter, columnMap);
+            final Map<String, Object> meta = new HashMap<>();
+            meta.put(RECORDCOUNT,
+                    DataServiceUtil.getMemberCount(data, RECORDCOUNT));
+            DataServiceUtil.removeKeyFromList(RECORDCOUNT, data);
+            meta.put(OFFSET, DataServiceUtil
+                    .getOffset(requestParameter,
+                            membersDAO.getDefaultPaging()));
+            final ResponseDTO responseDTO = new ResponseDTO();
+            responseDTO.setData(data);
+            responseDTO.setMeta(meta);
+            return responseDTO;
+        }
+    }
+
+    private boolean isEncodingApplied(IMembersDAO membersDAO){
+        return !credentialProvider.getMiscRights().isRealMemberId()
+                && membersDAO.getVersionControl().isGE808040();
+    }
+
+    private void setRequestPayload(MemberRequestParameters parameters,
+                                   String appId, IMembersDAO dao, Map<String, Column> columnMap,
+                                   UserMiscRights userMiscRights) {
+        final ViewExportDTO dto = parameters.getViewExport();
+        if (null != dto) {
+            try {
+                final ObjectMapper mapper = BatchExportUtil.getExportMapper();
+                if (null != dto.getId()) {
+                    revalidateRequestParameter(appId, parameters, dao);
+                    RequestParameterUtil.updatePageStateAndFilter(parameters, columnMap, mapper, dto);
+                }
+                String payload = mapper.writeValueAsString(parameters);
+                String formId = "MX_I301";
+                dto.setHasPhi(((FieldsConstant.hasPhiCols(parameters.getColumns()) && userMiscRights.isHasPHIAccess())
+                        || viewExportService.containsPhiDeniedForm(appId, formId, payload, dto.getPageFilter(), mapper)) ? "Y" : "N");
+                dto.setHasFinancial(userMiscRights.isShowFinancialNumber() ? "Y" : "N");
+                dto.setHasDxcg((FieldsConstant.hasDxcgAllowedCols(parameters.getColumns()) && userMiscRights.isDxcgAllowedAmountConfig()) ? "Y" : "N");
+                dto.setRequestPayload(mapper.writeValueAsString(parameters));
+                dto.setEncodingApplied(isEncodingApplied(dao));
+            } catch (JsonProcessingException e) {
+                throw new DataServiceException(INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    ResponseDTO getMemberClaimDetails(MemberRequestParameters requestParameter,
+                                      String appId) {
+        final UserMiscRights miscRights = credentialProvider.getMiscRights();
+
+        final Map<String, Column> columnMap = getAllColumns(appId);
+
+        final IMembersDAO membersDAO = getMembersDAO(appId);
+        final FiltersDTO filtersDTO = requestParameter.getFilters();
+        final List<String> columns = requestParameter.getColumns();
+        if (null != filtersDTO && !CollectionUtils
+                .isEmpty(filtersDTO.getColumnFilters())) {
+            requestParameter.setColumns(new ArrayList<>());
+            filtersDTO.getColumnFilters().forEach(filter -> {
+                requestParameter.getColumns().add(filter.getCol());
+            });
+            requestParameter.setColumns(requestParameter.getColumns().stream().filter(column -> null != column)
+                    .collect(Collectors.toList()));
+        }
+
+        if (!requestParameter.getColumns().contains(MEMID)) {
+            requestParameter.getColumns().add(0, MEMID);
+        }
+
+        final List<Map<String, Object>> data = membersDAO
+                .getMembersData(requestParameter, columnMap);
+        final List<String> nmemids = new ArrayList<>();
+        for (final Map<String, Object> members : data) {
+            nmemids.add(members.get("nmemid").toString());
+        }
+
+        final Map<String, Column> memberIdColMap = new LinkedHashMap<>();
+        memberIdColMap.put(MEMID, columnMap.get(MEMID));
+
+        requestParameter.setColumns(columns);
+        if (!requestParameter.getColumns().contains(MEMID)) {
+            requestParameter.getColumns().add(0, MEMID);
+        }
+
+        final Map<String, Column> claimColumnMap = indvClaimDetailService
+                .getIndvClaimDetailColumns(appId, true);
+        if (!claimColumnMap.containsKey(MEMID)) {
+            claimColumnMap.putAll(memberIdColMap);
+        }
+
+        final Integer maxRowLimit = databaseConfigService
+                .getUserFrontParamsByName("offlineExcelRowLimit");
+        final QueryAndParamsDTO memberClaimQuery = indvClaimDetailService
+                .getMemberClaimDetailsQuery(appId, requestParameter
+                                .cloneTo(new IndvClaimDetailsRequestParameter()),
+                        nmemids,
+                        miscRights, claimColumnMap, maxRowLimit);
+
+        final ExportDTO exportDTO = requestParameter.getExportFormat();
+        if (exportDTO.getNoOfRecords() > maxRowLimit) {
+            return checkForOfflineRowLimit(exportDTO);
+        }
+        if (exportDTO.getFormat() != null) {
+            exportDTO.setClaimDetailExport(true);
+        }
+
+        clearColumnsFilters(filtersDTO);
+
+        final ExcelOrCsv<MemberRequestParameters> excelOrCsv = new ExcelOrCsv<>();
+        excelOrCsv.setAppId(appId);
+        excelOrCsv.setFormId(indvClaimDetailService.getIndvClaimDetailFormId());
+        excelOrCsv.setColumnMap(claimColumnMap);
+        excelOrCsv.setUserMiscRights(miscRights);
+        excelOrCsv.setRequestParameter(requestParameter);
+        excelOrCsv.setMembersSqlWithParams(memberClaimQuery);
+        return dataExportService.generateSingleSheetExcelOrCsv(excelOrCsv);
+    }
+
+    ResponseDTO getMemberClaimDetailsRI005(
+            MemberRequestParameters requestParameter, String appId) {
+        final UserMiscRights miscRights = credentialProvider.getMiscRights();
+        final Map<String, Column> columnMap = getAllColumns(appId);
+        final FiltersDTO filtersDTO = requestParameter.getFilters();
+        final List<String> columns = requestParameter.getColumns();
+        if (!requestParameter.getColumns().contains(MEMID)) {
+            requestParameter.getColumns().add(0, MEMID);
+        }
+        final Map<String, Column> memberIdColMap = new LinkedHashMap<>();
+        memberIdColMap.put(MEMID, columnMap.get(MEMID));
+
+        requestParameter.setColumns(columns);
+        if (!requestParameter.getColumns().contains(MEMID)) {
+            requestParameter.getColumns().add(0, MEMID);
+        }
+        final Map<String, Column> claimColumnMap = indvClaimDetailService
+                .getIndvClaimDetailColumns(appId, true);
+        if (!claimColumnMap.containsKey(MEMID)) {
+            claimColumnMap.putAll(memberIdColMap);
+        }
+        final Integer maxRowLimit = databaseConfigService
+                .getUserFrontParamsByName("offlineExcelRowLimit");
+        final ExportDTO exportDTO = requestParameter.getExportFormat();
+        Map<String, Column> ri005ColumnMap = getRI005AllColumns(appId);
+        final QueryAndParamsDTO memberClaimQuery = indvClaimDetailService
+                .getMemberClaimDetailsRI005Query(appId, requestParameter,
+                        miscRights, ri005ColumnMap, claimColumnMap,
+                        maxRowLimit);
+        exportDTO.setNoOfRecords(indvClaimDetailService
+                .getRecordCountForRI005(memberClaimQuery, appId));
+        if (exportDTO.getNoOfRecords() > maxRowLimit) {
+            return checkForOfflineRowLimit(exportDTO);
+        }
+        if (exportDTO.getFormat() != null) {
+            exportDTO.setClaimDetailExport(true);
+        }
+        clearColumnsFilters(filtersDTO);
+        final ExcelOrCsv<MemberRequestParameters> excelOrCsv = new ExcelOrCsv<>();
+        excelOrCsv.setAppId(appId);
+        excelOrCsv.setFormId("MX_RI005_HMO");
+        excelOrCsv.setBusinessLvlsToShow(Collections.singletonList(3));
+        excelOrCsv.setExtraParamsMapper(dsp -> {
+            final List<Map<String, String>> extraParams = new ArrayList<>();
+            if (requestParameter.getAnalysisYr() != null) {
+                extraParams
+                        .add(ImmutableMap.of("Analysis Year",
+                                requestParameter.getAnalysisYr()));
+            }
+            return extraParams;
+        });
+        excelOrCsv.setColumnMap(claimColumnMap);
+        excelOrCsv.setUserMiscRights(miscRights);
+        excelOrCsv.setRequestParameter(requestParameter);
+        excelOrCsv.setMembersSqlWithParams(memberClaimQuery);
+        return dataExportService.generateSingleSheetExcelOrCsv(excelOrCsv);
+    }
+
+    private ResponseDTO checkForOfflineRowLimit(ExportDTO exportDTO) {
+        LOGGER.error("Offline {} export row limit exceeded {} ",
+                exportDTO.getFormat(), exportDTO.getNoOfRecords());
+        final ResponseDTO responseDTO = new ResponseDTO();
+        responseDTO
+                .addError(new ErrorDTO(ErrorCodes.OFFLINE_ROW_LIMIT_EXCEED,
+                        "The request exceeds export limitation. Please reduce the selection and try again."));
+        return responseDTO;
+    }
+
+    private void clearColumnsFilters(FiltersDTO filtersDTO) {
+        if (null != filtersDTO && !CollectionUtils
+                .isEmpty(filtersDTO.getColumnFilters())) {
+            filtersDTO.getColumnFilters().clear();
+        }
+    }
+
+    public ResponseDTO getMemberSliderInfo(String appId, String nmemid,
+                                           MemberRequestParameters requestParameters) {
+        ResponseDTO responseDTO = new ResponseDTO();
+        Map<String, Object> meta = new HashMap<>();
+        Map<String, Object> data = new HashMap<>();
+
+        UserMiscRights miscRights = credentialProvider.getMiscRights();
+        if (!miscRights.isHasMx301()) {
+            throw new DataServiceException(ErrorCodes.APPID_NOT_ALLOWED);
+        }
+        DXCGBean dxcgBean = dxcgService.getDxcgBean(appId, true);
+
+        List<Runnable> sliderTasks = new ArrayList<>();
+
+        for (String column : requestParameters.getColumns()) {
+            if (column.equals("indv")) {
+                MemberRequestParameters reqParam = (MemberRequestParameters) Cloner
+                        .cloneThis(requestParameters);
+                Runnable indvTask = () -> {
+                    IMembersDAO membersDAO = getMembersDAO(appId);
+                    Map<String, Object> indv = membersDAO
+                            .getIndvSliderData(nmemid, reqParam);
+                    data.put("indv", indv);
+                };
+                sliderTasks.add(indvTask);
+            }
+
+            if (column.equals("cost") && miscRights.isShowFinancialNumber()) {
+                MemberRequestParameters reqParam = (MemberRequestParameters) Cloner
+                        .cloneThis(requestParameters);
+                Runnable costTask = () -> {
+                    IMembersDAO membersDAO = getMembersDAO(appId);
+                    Map<String, Object> cost = membersDAO
+                            .getCostData(nmemid, reqParam,
+                                    getAllColumns(appId));
+                    data.put("cost", cost);
+                };
+                sliderTasks.add(costTask);
+            }
+
+            if (column.equals("utilization")) {
+                MemberRequestParameters reqParam = (MemberRequestParameters) Cloner
+                        .cloneThis(requestParameters);
+                Runnable utilizationTask = () -> {
+                    IMembersDAO membersDAO = getMembersDAO(appId);
+                    Map<String, Object> utilization = membersDAO
+                            .getUtilizationData(nmemid, reqParam,
+                                    getAllColumns(appId));
+                    data.put("utilization", utilization);
+                };
+                sliderTasks.add(utilizationTask);
+
+            }
+
+            if (column.equals("performance")) {
+                MemberRequestParameters reqParam = (MemberRequestParameters) Cloner
+                        .cloneThis(requestParameters);
+                Runnable performanceTask = () -> {
+                    IMembersDAO membersDAO = getMembersDAO(appId);
+                    Map<String, Object> performance = membersDAO
+                            .getPerformanceData(nmemid, reqParam,
+                                    getAllColumns(appId));
+                    data.put("performance", performance);
+                };
+                sliderTasks.add(performanceTask);
+            }
+
+            if (column.equals("risk") && dxCGUtil.isDxCGAllowed(appId)) {
+                MemberRequestParameters reqParam = (MemberRequestParameters) Cloner
+                        .cloneThis(requestParameters);
+                Runnable riskTask = () -> {
+                    IMembersDAO membersDAO = getMembersDAO(appId);
+                    List<Column> bobColumns = getColumnsForBOBRRS(BOB_RISK_ID,
+                            dxcgBean);
+                    List<Map<String, Object>> riskList = new ArrayList<>();
+                    Map<String, Object> risk = membersDAO
+                            .getRiskData(nmemid, reqParam,
+                                    getAllColumns(appId), bobColumns);
+                    for (Column col : bobColumns) {
+                        Map<String, Object> modelMap = new HashMap<>();
+                        String colNo = col.getName()
+                                .substring(col.getName().length() - 1);
+                        DXCGModel model = dxcgBean.getRiskModelMap().get(colNo);
+                        modelMap.put("bbrrs", risk.get(col.getName()));
+                        modelMap.put("type", model.getAnalysisYearType());
+                        modelMap.put("model_no", model.getModelNo());
+                        modelMap.put("model_name", model.getModelName());
+                        modelMap.put("generic_name",
+                                model.getModelGenericName());
+                        riskList.add(modelMap);
+                    }
+                    data.put("risk", riskList);
+                };
+                sliderTasks.add(riskTask);
+            }
+
+            if (column.contains("topprospectiverisk") && null != dxcgBean
+                    .getRiskDriverCostModel()) {
+                MemberRequestParameters reqParam = (MemberRequestParameters) Cloner
+                        .cloneThis(requestParameters);
+                Runnable riskTask = () -> {
+                    IMembersDAO membersDAO = getMembersDAO(appId);
+                    List<Map<String, Object>> topprospectiverisk = membersDAO
+                            .getRiskDriverData(nmemid, reqParam,
+                                    getAllColumns(appId));
+                    data.put("topprospectiverisk", topprospectiverisk);
+                };
+                sliderTasks.add(riskTask);
+            }
+        }
+
+        ThreadUtils.executeInParallel(sliderTasks);
+
+        responseDTO.setData(data);
+        responseDTO.setMeta(meta);
+
+        return responseDTO;
+    }
+
+    public ResponseDTO sendToOutbox(
+            IndvLetterGenerationRequestParams requestParams,
+            String appId) {
+        final IMembersDAO membersDAO = getMembersDAO(appId);
+        final UserMiscRights miscRights = credentialProvider.getMiscRights();
+
+        requestParams.setColumns(
+                getValidColumns(miscRights, requestParams.getColumns(),
+                        appId));
+        final Map<String, Column> columnMap = getAllColumns(appId);
+        applyMiscRights(miscRights, columnMap, appId);
+
+        ResponseDTO responseDTO = new ResponseDTO();
+
+        SendToOutBoxRequestParams sendToOutBoxRequestParams = new SendToOutBoxRequestParams();
+        if (null != requestParams.getCohort()) {
+            sendToOutBoxRequestParams.setCohortDTO(membersDAO
+                    .getCohortDetails(requestParams.getCohort().getId()));
+        }
+        sendToOutBoxRequestParams.setFrom(requestParams.getFrom());
+        sendToOutBoxRequestParams.setTemplateId(requestParams.getTemplateID());
+        sendToOutBoxRequestParams
+                .setTemplateCategoryId(requestParams.getTemplateCategoryId());
+        sendToOutBoxRequestParams.setLetterName(requestParams.getLetterName());
+        sendToOutBoxRequestParams
+                .setNotification(requestParams.isNotification());
+        sendToOutBoxRequestParams.setSource(requestParams.getSource());
+        sendToOutBoxRequestParams
+                .setExclude(requestParams.getStrSelMemIDs().getExclude());
+        sendToOutBoxRequestParams
+                .setInclude(requestParams.getStrSelMemIDs().getInclude());
+        sendToOutBoxRequestParams
+                .setMemberRecordCount(requestParams.getMemberRecordCount());
+        SendToOutBoxDao sendToOutBoxDao = context
+                .getBean(SendToOutBoxDao.class, appId);
+        QueryAndParamsDTO outboxMemQry = membersDAO
+                .getMembersSql(requestParams, columnMap);
+        Boolean readyForOutbox = sendToOutBoxDao
+                .sendToOutbox(sendToOutBoxRequestParams, outboxMemQry, null);
+
+        Map<String, Object> meta = new HashMap<>();
+        meta.put("errorMessage", requestParams.getErrorMsg());
+        responseDTO.setData(readyForOutbox);
+        responseDTO.setMeta(meta);
+        return responseDTO;
+    }
+
+    public ResponseDTO getAggregate(MemberRequestParameters requestParameter,
+                                    String appId) {
+        IMembersDAO membersDAO = getMembersDAO(appId);
+        Map<String, Object> meta = new HashMap<>();
+        ResponseDTO responseDTO = new ResponseDTO();
+        DXCGBean dxcgBean = dxcgService.getDxcgBean(appId, true);
+
+        List<String> selectedColumns = new ArrayList<>(
+                requestParameter.getColumns());
+        List<String> bbrrsColumns = new ArrayList<>();
+        for (String column : requestParameter.getColumns()) {
+            if (column.contains("risk")) {
+                selectedColumns.remove(column);
+                for (Column col : getColumnsForBOBRRS(BOB_RISK_ID, dxcgBean)) {
+                    bbrrsColumns
+                            .add(col.getName() + ":" + (column.contains(":") ?
+                                    Iterables
+                                            .getLast(Splitter.on(":")
+                                                    .split(column), "") :
+                                    ""));
+                }
+            }
+        }
+        selectedColumns.addAll(bbrrsColumns);
+        requestParameter.setColumns(selectedColumns);
+
+        List<Map<String, Object>> data = membersDAO
+                .getAggregateData(requestParameter, getAllColumns(appId));
+
+        List<Map<String, Object>> temp = new ArrayList<>();
+
+        for (Map<String, Object> risk : data) {
+            Map<String, Object> tempMap = new HashMap<>(risk);
+            for (String col : bbrrsColumns) {
+                String colName = col.replace(":", "_");
+                if (risk.keySet().contains(colName)) {
+                    String colNo = col
+                            .substring("bbrrs".length(), "bbrrs".length() + 1);
+                    DXCGModel model = dxcgBean.getRiskModelMap().get(colNo);
+                    Object o = risk.get(colName);
+                    tempMap.remove(colName);
+                    tempMap.put(
+                            colName.replace(colNo, "_" + model.getModelNo()),
+                            o);
+                }
+            }
+            temp.add(tempMap);
+        }
+        meta.put(MEMBERCOUNT,
+                DataServiceUtil.getAggregateCount(temp, MEMBERCOUNT));
+        DataServiceUtil.removeKeyFromList(MEMBERCOUNT, temp);
+
+        responseDTO.setData(temp);
+        responseDTO.setMeta(meta);
+
+        return responseDTO;
+    }
+
+    public ResponseDTO getMonthlyTrend(MemberRequestParameters requestParameter,
+                                       String appId) {
+        IMembersDAO membersDAO = getMembersDAO(appId);
+        Map<String, Object> meta = new HashMap<>();
+        ResponseDTO responseDTO = new ResponseDTO();
+
+        List<Map<String, Object>> data = membersDAO
+                .getMonthlyTrendData(requestParameter, getAllColumns(appId));
+
+        responseDTO.setData(data);
+        responseDTO.setMeta(meta);
+
+        return responseDTO;
+    }
+
+    public ResponseDTO getNmemId(String memId, String appId) {
+
+        Integer nmemId = getMembersDAO(appId).getNmemId(memId);
+
+        if (nmemId != null) {
+            ResponseDTO responseDTO = new ResponseDTO();
+            responseDTO.setData(nmemId);
+            return responseDTO;
+        } else {
+            throw new DataServiceException("Member not found",
+                    ErrorCodes.NOT_FOUND)
+                    .set("appId", appId)
+                    .set("memId", memId);
+        }
+    }
+
+    @Override
+    public Map<String, Column> getAllColumns(String appId) {
+        final ClientParams clientParams = appConfigurations
+                .getClientParams(appId);
+        final UserMiscRights miscRights = credentialProvider.getMiscRights();
+        if (appConfigurations.getClientParams(appId).isDistributedClient()) {
+            return getAllColumnsForDistributedApp(appId);
+        }
+
+        Map<String, Column> columnMap = new LinkedHashMap<>();
+        List<Column> allColumns = columnService.getAllColumns(FORM_ID, appId);
+        allColumns.addAll(getDynamicColumns(appId, true));
+
+        final IMembersDAO membersDAO = getMembersDAO(appId);
+        int maxApplicableBusinessLevel = membersDAO.getMaxLevel();
+        if (membersDAO.useChaseListCol()) {
+            Column column = new Column();
+            column.setName("chaselist");
+            column.setActive(true);
+            column.setAlignment(AlignTypes.CENTER);
+            column.setDescription("Part of Chase List");
+            column.setLabel("Part of Chase List");
+            column.setSortable(true);
+            column.setFilterable(true);
+            column.setFormId("MX_I301_INDV");
+            column.setIsdefault(false);
+            column.setType(ColTypes.STRING);
+            column.setPhiType(PhiTypes.NONE);
+            allColumns.add(column);
+        }
+        Collections.sort(allColumns, Comparator
+                .comparing(Column::getLabel, String::compareToIgnoreCase));
+        for (Column col : allColumns) {
+            columnMap.put(col.getName(), col);
+        }
+        if (!membersDAO.isQiIntegrationFlow() && !membersDAO.isHedisClaimBasedFlow()) {
+            columnMap.remove("hedisgapcount");
+        }
+        if(!membersDAO.isQiIntegrationFlow()){
+            columnMap.remove("statencustomgapcount");
+        }
+        if (membersDAO.isQiIntegrationFlow()) {
+                columnMap.get("hedisgapcount").setLabel("# of Gaps in Care - Certified Hedis");
+                columnMap.get("hedisgapcount").setDescription("# of Gaps in Care - Certified Hedis");
+        }
+
+        if (!membersDAO.getVersionControl().isGE8070()) {
+            columnMap.remove("hrapaidamt");
+            columnMap.remove("hraallowedamt");
+        }
+        if (!membersDAO.getVersionControl().isGE8020()) {
+            columnMap.remove("telehealthregularcount");
+            columnMap.remove("telehealthpandemiccount");
+        }
+        if (!membersDAO.getVersionControl().isGT7130()) {
+            columnMap.remove("avoidervisitcount");
+        }
+        if(!clientParams.isReAdmission()){
+            columnMap.remove("readmissionin30dayscount");
+            columnMap.remove("readmissionin60dayscount");
+        }
+        if (!membersDAO.getVersionControl().isGE8080()) {
+            columnMap.remove("totempmedpaidamt");
+            columnMap.remove("totemprxpaidamt");
+            columnMap.remove("totemppaidamt");
+            columnMap.remove("pridiagservicedate");
+        }
+        if(!membersDAO.isTruePerformanceFlow()) {
+            columnMap.remove("tpgapcount");
+        }
+
+        if(!miscRights.isDxcgAllowedAmountConfig()) {
+            columnMap.remove("medexpend1");
+            columnMap.remove("rxexpend1");
+            columnMap.remove("totalexpend1");
+        }
+
+        for (int i = 6; i > maxApplicableBusinessLevel; i--) {
+            columnMap.remove("lvl"+i+"desc");
+        }
+        applyMiscRights(appId, columnMap);
+        return columnMap;
+    }
+
+
+    public String getDefaultSortColumn(String appId) {
+        UserMiscRights miscRights = credentialProvider.getMiscRights();
+        return miscRights.isShowFinancialNumber() ?
+                "totpaidamt" :
+                appConfigurations.getClientParams(appId).isDistributedClient() ?
+                        "ervisitcount" :
+                        "curflag";
+    }
+
+    private static final Set<String> ALLCOLS_FOR_DISTRIBUTED = Sets
+            .newHashSet(MEMID, MEM_NAME_COL, "age", "gender", "delri",
+                    "newdelri", "admitcount", "ervisitcount", "officevisitcount",
+                    "medpaidamt", "rxpaidamt", "totpaidamt", "nmemid", "hasclm",
+                    "haselig");
+
+    private Map<String, Column> getAllColumnsForDistributedApp(String appId) {
+        final Map<String, Column> columnMap = new LinkedHashMap<>();
+        List<Column> allColumns = columnService.getAllColumns(FORM_ID, appId);
+        Collections.sort(allColumns, Comparator
+                .comparing(Column::getLabel, String::compareToIgnoreCase));
+        for (Column col : allColumns) {
+            if (ALLCOLS_FOR_DISTRIBUTED.contains(col.getName())) {
+                columnMap.put(col.getName(), col);
+            }
+        }
+        context.getBean(UDFDAO.class, appId).getAllUdfCriteria().stream()
+                .map(this::udf2Column).collect(() -> columnMap,
+                (Map<String, Column> m, Column c) -> m.put(c.getName(), c),
+                (m1, m2) -> m1.putAll(m2));
+        applyMiscRights(appId, columnMap);
+        ClientParams cp = appConfigurations.getClientParams(appId);
+        if (!(cp.isUseOldAndNewCGI() || cp.isUseCustomCGI() || cp
+                .isCgiEnrollment())) {
+            columnMap.remove("newari");
+            columnMap.remove("newdelri");
+        }
+        return columnMap;
+    }
+
+    private Column udf2Column(UdfDto u) {
+        ColTypes colType = ColTypes.STRING;
+        switch (u.getFieldType()) {
+            case 2:
+                colType = ColTypes.DATE;
+                break;
+            case 0:
+            case 3:
+                colType = ColTypes.FLOAT;
+                break;
+            default:
+                colType = ColTypes.STRING;
+        }
+        return new Column(u.getUdfId(), u.getUdfId(), u.getUdfDescription(),
+                true, true, colType);
+    }
+
+    public List<Column> getDynamicColumns(String appId,
+                                          boolean isAddRiskDriveCols) {
+        List<Column> dynamicColumns = new ArrayList<>();
+        UserMiscRights miscRights = credentialProvider.getMiscRights();
+        if (dxCGUtil.isDxCGAllowed(appId)) {
+            DXCGModelInfoDAO dxcgDao = context
+                    .getBean(DXCGModelInfoDAO.class, appId);
+            boolean isPopulationTypeMixed = "MIXED"
+                    .equalsIgnoreCase(dxcgDao.getPopulationType());
+            DXCGBean dxcgBean = dxcgService.getDxcgBean(appId, true);
+
+            if (dxcgBean.isShowLoh()) {
+                dynamicColumns.addAll(getColumnsLOH(LOH_ID, dxcgBean,
+                        isPopulationTypeMixed));
+            }
+            if (dxcgBean.isShowLoed()) {
+                dynamicColumns.addAll(getColumnsLOED(LOED_ID, dxcgBean,
+                        isPopulationTypeMixed));
+            }
+            if (dxcgBean.isShowRisk()) {
+                dynamicColumns
+                        .addAll(getColumnsMSRRS(MARKET_SCAN_ID, dxcgBean));
+                if (miscRights.isShowBOBValue()) {
+                    dynamicColumns
+                            .addAll(getColumnsForBOBRRS(BOB_RISK_ID, dxcgBean));
+                    if (isShowPredictedCost(miscRights)) {
+                        dynamicColumns.addAll(getColumnsForBOBPredCost(
+                                BOB_PRED_ALLOWED_ID,
+                                dxcgBean));
+                    }
+                }
+            }
+            if (isAddRiskDriveCols) {
+                dynamicColumns.addAll(getColumnsForRiskDrive(appId, dxcgBean,
+                        isPopulationTypeMixed));
+            }
+        }
+        return dynamicColumns;
+    }
+
+    private List<Column> getColumnsLOH(String id, DXCGBean dxcgBean,
+                                       boolean isPopulationTypeMixed) {
+        List<Column> columns = new ArrayList<>();
+        List<Category> category = Arrays
+                .asList(new Category(CategoryTypes.DXCG.getName(),
+                        CategoryTypes.DXCG.getLabel()));
+        String lohName;
+        String lohLabel;
+        String lohDescription;
+        for (Map.Entry<String, DXCGModel> entry : dxcgBean.getLohModelMap()
+                .entrySet()) {
+            DXCGModel lohModel = entry.getValue();
+
+            if (isPopulationTypeMixed) {
+                lohName = NAME.get(id);
+                lohLabel = lohModel.getModelGenericName();
+            } else {
+                lohName = NAME.get(id);
+                lohLabel = LABEL.get(id);
+            }
+            lohDescription = lohModel.getModelMouseOver();
+            columns.add(
+                    new Column(lohName, lohLabel, lohDescription, category,
+                            ColTypes.FLOAT));
+        }
+        return columns;
+    }
+
+    private List<Column> getColumnsLOED(String id, DXCGBean dxcgBean,
+                                        boolean isPopulationTypeMixed) {
+        List<Column> columns = new ArrayList<>();
+        List<Category> category = Arrays
+                .asList(new Category(CategoryTypes.DXCG.getName(),
+                        CategoryTypes.DXCG.getLabel()));
+
+        String loedName;
+        String loedLabel;
+        String loedDescription;
+        for (Map.Entry<String, DXCGModel> entry : dxcgBean.getLoedModelMap()
+                .entrySet()) {
+            DXCGModel loedModel = entry.getValue();
+            if (isPopulationTypeMixed) {
+                loedName = NAME.get(id);
+                loedLabel = loedModel.getModelGenericName();
+
+            } else {
+                loedName = NAME.get(id);
+                loedLabel = LABEL.get(id);
+            }
+            loedDescription = loedModel.getModelMouseOver();
+            columns.add(new Column(loedName, loedLabel, loedDescription,
+                    category,
+                    ColTypes.FLOAT));
+        }
+        return columns;
+    }
+
+    private List<Column> getColumnsMSRRS(String id, DXCGBean dxcgBean) {
+        List<Column> columns = new ArrayList<>();
+        List<Category> category = Arrays
+                .asList(new Category(CategoryTypes.DXCG.getName(),
+                        CategoryTypes.DXCG.getLabel()));
+
+        String riskName;
+        String riskLabel;
+        String riskDescription;
+        if (null == dxcgBean.getMixedRiskModelMap() || dxcgBean
+                .getMixedRiskModelMap().isEmpty()) {
+            for (Map.Entry<String, DXCGModel> entry : dxcgBean
+                    .getRiskModelMap()
+                    .entrySet()) {
+                DXCGModel rrsModel = entry.getValue();
+                riskName = NAME.get(id) + entry.getKey();
+                riskLabel = LABEL.get(id) + MODEL_NO + rrsModel.getModelNo()
+                        + MARKET_SCAN_SYMBOL;
+                riskDescription = DESCRIPTION.get(id) + MODEL_NO + rrsModel
+                        .getModelNo() + "(" + rrsModel.getModelName() + ")";
+
+                columns.add(new Column(riskName, riskLabel, riskDescription,
+                        category,
+                        ColTypes.FLOAT));
+            }
+        } else {
+            for (Map.Entry<String, Map<String, DXCGModel>> it : dxcgBean
+                    .getMixedRiskModelMap().entrySet()) {
+                Map.Entry<String, DXCGModel> entry = it.getValue()
+                        .entrySet().iterator().next();
+                String key = it.getKey();
+                DXCGModel rrsModel = entry.getValue();
+                riskName = NAME.get(id) + key;
+                riskLabel = LABEL.get(id) + rrsModel.getModelGenericName()
+                        + MARKET_SCAN_SYMBOL;
+                riskDescription =
+                        DESCRIPTION.get(id) + rrsModel.getModelMouseOver();
+
+                columns.add(new Column(riskName, riskLabel, riskDescription,
+                        category,
+                        ColTypes.FLOAT));
+            }
+        }
+        return columns;
+    }
+
+    private List<Column> getColumnsForBOBRRS(String id, DXCGBean dxcgBean) {
+        List<Column> columns = new ArrayList<>();
+        List<Category> category = Arrays
+                .asList(new Category(CategoryTypes.DXCG.getName(),
+                        CategoryTypes.DXCG.getLabel()));
+
+        String riskName;
+        String riskLabel;
+        String riskDescription;
+        if (null == dxcgBean.getMixedRiskModelMap() || dxcgBean
+                .getMixedRiskModelMap().isEmpty()) {
+            for (Map.Entry<String, DXCGModel> entry : dxcgBean
+                    .getRiskModelMap()
+                    .entrySet()) {
+                DXCGModel rrsModel = entry.getValue();
+                // asm is not applicable to bob columns
+                if (ASM.equalsIgnoreCase(rrsModel.getModelType())) {
+                    continue;
+                }
+                riskName = NAME.get(id) + entry.getKey();
+                riskLabel = LABEL.get(id) + MODEL_NO + rrsModel.getModelNo()
+                        + BOOK_OF_BUSINESS_SYMBOL;
+                riskDescription = DESCRIPTION.get(id) + MODEL_NO + rrsModel
+                        .getModelNo() + "(" + rrsModel.getModelName() + ")";
+                columns.add(new Column(riskName, riskLabel, riskDescription,
+                        category,
+                        ColTypes.FLOAT));
+
+            }
+        } else {
+            for (Map.Entry<String, Map<String, DXCGModel>> it : dxcgBean
+                    .getMixedRiskModelMap().entrySet()) {
+                Map.Entry<String, DXCGModel> entry = it.getValue()
+                        .entrySet().iterator().next();
+                String key = it.getKey();
+                DXCGModel rrsModel = entry.getValue();
+                // asm is not applicable to bob columns
+                if (ASM.equalsIgnoreCase(rrsModel.getModelType())) {
+                    continue;
+                }
+                riskName = NAME.get(id) + key;
+                riskLabel = LABEL.get(id) + rrsModel.getModelGenericName()
+                        + BOOK_OF_BUSINESS_SYMBOL;
+                riskDescription =
+                        LABEL.get(id) + rrsModel.getModelNo() + MODEL_NO
+                                + DESCRIPTION.get(id);
+                columns.add(new Column(riskName, riskLabel, riskDescription,
+                        category,
+                        ColTypes.FLOAT));
+            }
+        }
+        return columns;
+    }
+
+    private List<Column> getColumnsForBOBPredCost(String id,
+                                                  DXCGBean dxcgBean) {
+        List<Column> columns = new ArrayList<>();
+        List<Category> category = Arrays
+                .asList(new Category(CategoryTypes.DXCG.getName(),
+                        CategoryTypes.DXCG.getLabel()));
+
+        String costName;
+        String costLabel;
+        String costDescription;
+        if (null == dxcgBean.getMixedRiskModelMap() || dxcgBean
+                .getMixedRiskModelMap().isEmpty()) {
+            for (Map.Entry<String, DXCGModel> entry : dxcgBean
+                    .getRiskModelMap()
+                    .entrySet()) {
+                DXCGModel costModel = entry.getValue();
+                // asm is not applicable to bob columns
+                if (ASM.equalsIgnoreCase(costModel.getModelType())) {
+                    continue;
+                }
+                if (costModel.getAnalysisYearType()
+                        .equalsIgnoreCase("CONCURRENT")) {
+
+                    costName = NAME.get(BOB_PRED_ALLOWED_PARTIAL_ID) + entry
+                            .getKey();
+                    costLabel =
+                            LABEL.get(id) + MODEL_NO + costModel.getModelNo()
+                                    + " (" + costModel.getOutcomeType()
+                                    + ")" + BOOK_OF_BUSINESS_SYMBOL
+                                    + PREDICTIVE_COST_PARTIAL_SYMBOL;
+                    costDescription =
+                            DESCRIPTION.get(id) + MODEL_NO + costModel
+                                    .getModelNo() + " (" + costModel
+                                    .getOutcomeType() + ") Partial Year";
+                    columns.add(
+                            new Column(costName, costLabel, costDescription,
+                                    category,
+                                    ColTypes.DOLLAR));
+
+                    costName = NAME.get(BOB_PRED_ALLOWED_FULL_ID) + entry
+                            .getKey();
+                    costLabel =
+                            LABEL.get(id) + MODEL_NO + costModel.getModelNo()
+                                    + " (" + costModel.getOutcomeType()
+                                    + ")" + BOOK_OF_BUSINESS_SYMBOL
+                                    + PREDICTIVE_COST_FULL_SYMBOL;
+                    costDescription =
+                            DESCRIPTION.get(id) + MODEL_NO + costModel
+                                    .getModelNo() + " (" + costModel
+                                    .getOutcomeType() + ") Full Year";
+                    columns.add(
+                            new Column(costName, costLabel, costDescription,
+                                    category,
+                                    ColTypes.DOLLAR));
+                } else {
+                    costName = NAME.get(id) + entry.getKey();
+                    costLabel =
+                            LABEL.get(id) + MODEL_NO + costModel.getModelNo()
+                                    + " (" + costModel.getOutcomeType()
+                                    + ")" + BOOK_OF_BUSINESS_SYMBOL;
+                    costDescription =
+                            DESCRIPTION.get(id) + MODEL_NO + costModel
+                                    .getModelNo() + " (" + costModel
+                                    .getOutcomeType() + ")";
+                    columns.add(
+                            new Column(costName, costLabel, costDescription,
+                                    category,
+                                    ColTypes.DOLLAR));
+                }
+
+            }
+
+        } else {
+            for (Map.Entry<String, Map<String, DXCGModel>> it : dxcgBean
+                    .getMixedRiskModelMap().entrySet()) {
+                Map.Entry<String, DXCGModel> entry = it.getValue()
+                        .entrySet().iterator().next();
+                String key = it.getKey();
+                DXCGModel costModel = entry.getValue();
+                // asm is not applicable to bob columns
+                if (ASM.equalsIgnoreCase(costModel.getModelType())) {
+                    continue;
+                }
+                if (costModel.getAnalysisYearType()
+                        .equalsIgnoreCase("CONCURRENT")) {
+
+                    costName = NAME.get(BOB_PRED_ALLOWED_PARTIAL_ID) + key;
+                    costLabel =
+                            LABEL.get(id) + costModel.getModelGenericName()
+                                    + "(Total Cost)"
+                                    + BOOK_OF_BUSINESS_SYMBOL
+                                    + PREDICTIVE_COST_PARTIAL_SYMBOL;
+                    costDescription = DESCRIPTION.get(id) + costModel
+                            .getModelMouseOver() + " Partial Year";
+                    columns.add(
+                            new Column(costName, costLabel, costDescription,
+                                    category,
+                                    ColTypes.FLOAT));
+
+                    costName = NAME.get(BOB_PRED_ALLOWED_FULL_ID) + key;
+                    costLabel =
+                            LABEL.get(id) + costModel.getModelGenericName()
+                                    + " (Total Cost)"
+                                    + BOOK_OF_BUSINESS_SYMBOL
+                                    + PREDICTIVE_COST_FULL_SYMBOL;
+                    costDescription = DESCRIPTION.get(id) + costModel
+                            .getModelMouseOver() + " Full Year";
+                    columns.add(
+                            new Column(costName, costLabel, costDescription,
+                                    category,
+                                    ColTypes.FLOAT));
+                } else {
+                    costName = NAME.get(id) + key;
+                    costLabel =
+                            LABEL.get(id) + costModel.getModelGenericName()
+                                    + " (Total Cost)"
+                                    + BOOK_OF_BUSINESS_SYMBOL;
+                    costDescription = DESCRIPTION.get(id) + costModel
+                            .getModelMouseOver();
+                    columns.add(
+                            new Column(costName, costLabel, costDescription,
+                                    category,
+                                    ColTypes.FLOAT));
+                }
+
+            }
+
+        }
+        return columns;
+    }
+
+    private List<Column> getColumnsForRiskDrive(String appId, DXCGBean dxcgBean,
+                                                boolean isPopulationTypeMixed) {
+        List<Column> columns = new ArrayList<>();
+
+        DXCGModel riskDriveLOHModel = PopulationRiskDriverUtils
+                .getRiskDriverLOHModel(dxcgBean.getLohModelMap());
+        DXCGModel riskDriveLOEDModel = PopulationRiskDriverUtils
+                .getRiskDriverLOEDModel(dxcgBean.getLoedModelMap());
+        DXCGModel riskDriveCostModel = PopulationRiskDriverUtils
+                .getRiskDriverCostModel(dxcgBean.getRiskModelMap());
+
+        if (null != riskDriveLOHModel) {
+            String modelNo = isPopulationTypeMixed ?
+                    "" :
+                    MODEL_NO + riskDriveLOHModel.getModelNo() + " ";
+            columns.addAll(getRiskDriveColumnFor(appId, RISK_DRIVE_LOH_ID,
+                    modelNo));
+        }
+        if (null != riskDriveLOEDModel) {
+            String modelNo = isPopulationTypeMixed ?
+                    "" :
+                    MODEL_NO + riskDriveLOEDModel.getModelNo() + " ";
+            columns.addAll(getRiskDriveColumnFor(appId, RISK_DRIVE_LOED_ID,
+                    modelNo));
+        }
+        if (null != riskDriveCostModel) {
+            String modelNo = isPopulationTypeMixed ?
+                    "" :
+                    MODEL_NO + riskDriveCostModel.getModelNo() + " ";
+            columns.addAll(getRiskDriveColumnFor(appId, RISK_DRIVE_COST_RISK_ID,
+                    modelNo));
+            columns.addAll(
+                    getRiskDriveColumnFor(appId, RISK_DRIVE_COST_ALLOWED_AMOUNT_ID,
+                            modelNo));
+        }
+        return columns;
+    }
+
+    private List<Column> getRiskDriveColumnFor(String appId, String id, String modelNo) {
+        List<Column> columns = new ArrayList<>();
+        List<Category> category = Arrays
+                .asList(new Category(CategoryTypes.RISK.getName(),
+                        CategoryTypes.RISK.getLabel()));
+        IMembersDAO membersDAO = getMembersDAO(appId);
+        Map<Integer, String> ccToDiseaseMap = membersDAO.getCCToDiseaseMap();
+        for (Map.Entry<Integer, String> entry : DISEASE_ID.entrySet()) {
+            Integer diseaseKey = entry.getKey();
+            String diseaseValue = entry.getValue();
+
+            String name = diseaseValue + "_" + NAME.get(id);
+            String label =
+                    LABEL.get(id) + modelNo + ccToDiseaseMap
+                            .get(diseaseKey);
+            String description =
+                    DESCRIPTION.get(id) + ccToDiseaseMap.get(diseaseKey);
+            ColTypes colType = ColTypes.PERCENTAGE;
+            String format = "percent:1.1-1";
+
+            if (id.equals(RISK_DRIVE_COST_RISK_ID)) {
+                label =
+                        LABEL.get(id) + modelNo + ccToDiseaseMap
+                                .get(diseaseKey) + " (%)";
+                description = DESCRIPTION.get(id) + modelNo + ccToDiseaseMap
+                        .get(diseaseKey);
+                colType = ColTypes.PERCENTAGE;
+            } else if (id.equals(RISK_DRIVE_COST_ALLOWED_AMOUNT_ID)) {
+                label =
+                        LABEL.get(id) + modelNo + ccToDiseaseMap
+                                .get(diseaseKey) + " ($)";
+                description = DESCRIPTION.get(id) + modelNo + ccToDiseaseMap
+                        .get(diseaseKey) + " ($)";
+                colType = ColTypes.DOLLAR;
+                format = null;
+            }
+
+            columns.add(instantiateColumn(name, label, description, category,
+                    colType, format));
+        }
+        return columns;
+    }
+
+    private Column instantiateColumn(String name, String label,
+                                     String description,
+                                     List<Category> category, ColTypes colType, String format) {
+        Column column = new Column(name, label, description, category, colType);
+        column.setFormat(format);
+
+        return column;
+    }
+
+    public boolean isShowPredictedCost(UserMiscRights miscRights) {
+        return miscRights.isShowDxCGPredictedCost() && miscRights
+                .isShowFinancialNumber();
+    }
+
+    public void applyMiscRights(String appId, Map<String, Column> columns) {
+        applyMiscRights(credentialProvider.getMiscRights(), columns, appId);
+    }
+
+    private void applyMiscRights(UserMiscRights miscRights,
+                                 Map<String, Column> columns, String appId) {
+        List<String> validColumns = getValidColumns(miscRights,
+                columns.keySet(), appId);
+        columns.keySet().retainAll(validColumns);
+
+        if (!miscRights.isRealMemberId() && columns.containsKey("memid")) {
+            columns.get("memid").setSortable(false);
+        }
+
+        boolean isShowMemberRight =
+                miscRights.isShowMembername() && miscRights.isDemographic()
+                        && miscRights.isRealMemberId();
+        if (!isShowMemberRight && columns.containsKey("dob")) {
+            columns.get("dob").setFilterable(false);
+            columns.get("dob").setSortable(false);
+        }
+    }
+
+    public List<String> getValidColumns(UserMiscRights miscRights,
+                                        Collection<String> allColumns, String appId) {
+        final IMembersDAO membersDAO = getMembersDAO(appId);
+        VersionControlUtil versionControlUtil = context
+                .getBean(VersionControlUtil.class, appId);
+        List<String> validColumns = new ArrayList<>();
+        validColumns.addAll(allColumns);
+
+        if (!miscRights.isRiskIndex()) {
+            validColumns.remove("riskcount");
+            validColumns.remove("ari");
+            validColumns.remove("ritrend");
+            validColumns.remove("ri30d");
+            validColumns.remove("delri");
+            validColumns.remove("newari");
+            validColumns.remove("newdelri");
+        }
+
+        if (!miscRights.isShowBOBValue()) {
+            validColumns.remove("normalizedtobookofbusiness");
+            validColumns.remove("predictedallowedamountbb");
+            validColumns.remove("relativeriskscorebb");
+        }
+
+        if (!isShowMemberRight(miscRights)) {
+            validColumns.remove(MEM_NAME_COL);
+            validColumns.remove("homephone");
+        }
+
+        boolean checkHRA =
+                miscRights.isDemographic() && miscRights.isAllowHRA();
+        if (!checkHRA) {
+            validColumns.remove("smoking_yn");
+            validColumns.remove("bmi");
+        }
+
+        if (!miscRights.isShowUDFFields()) {
+            //remove all udfs
+            List<String> udfFields = validColumns.stream()
+                    .filter(s -> s.startsWith("udf"))
+                    .collect(Collectors.toList());
+            for (String field : udfFields) {
+                validColumns.remove(field);
+            }
+        }
+
+        if (!miscRights.isShowFinancialNumber()) {
+            validColumns.remove("totbilledamt");
+            validColumns.remove("totallowedamt");
+            validColumns.remove("medpaidamt");
+            validColumns.remove("rxpaidamt");
+            validColumns.remove("totpaidamt");
+            validColumns.remove("copayamt");
+            validColumns.remove("coinsamt");
+            validColumns.remove("deductamt");
+            validColumns.remove("medexpend1");
+            validColumns.remove("rxexpend1");
+            validColumns.remove("totalexpend1");
+            validColumns.remove("cardio_resp_arr_riskdrivepredallamt");
+            validColumns.remove("cardiovascular_riskdrivepredallamt");
+            validColumns.remove("cerebrovascular_riskdrivepredallamt");
+            validColumns.remove("diabetes_riskdrivepredallamt");
+            validColumns
+                    .remove("musculoskeletal_conn_tiss_riskdrivepredallamt");
+            validColumns.remove("pulmonary_riskdrivepredallamt");
+            validColumns.remove("substance_abuse_riskdrivepredallamt");
+            validColumns.remove("hrapaidamt");
+            validColumns.remove("hraallowedamt");
+        }
+
+        if(!miscRights.isDxcgAllowedAmountConfig()) {
+            validColumns.remove("medexpend1");
+            validColumns.remove("rxexpend1");
+            validColumns.remove("totalexpend1");
+        }
+
+        if (!miscRights.isShowFinancialNumber() || !membersDAO.getVersionControl().isGE8080()) {
+            validColumns.remove("totempmedpaidamt");
+            validColumns.remove("totemprxpaidamt");
+            validColumns.remove("totemppaidamt");
+        }
+
+        if (!membersDAO.getVersionControl().isGE8080()) {
+            validColumns.remove("pridiagservicedate");
+        }
+
+        if(!membersDAO.isTruePerformanceFlow()){
+            validColumns.remove("tpgapcount");
+        }
+
+        if (!membersDAO.isEpisodeEnabled() || !miscRights.isShowEpisodeGrouper()) {
+            validColumns.remove("epicount");
+        }
+
+        if (!miscRights.isAllowHHAProfiler()) {
+            validColumns.remove("tothhaservices");
+            validColumns.remove("avgepispserv");
+            validColumns.remove("totdayshhaservices");
+        }
+
+        if (!versionControlUtil.isGT790()) {
+            validColumns.remove("populationtype");
+        }
+
+        if (!appConfigurations.getClientParams(appId).isReAdmission()) {
+            validColumns.remove("eligreadmitcount");
+            validColumns.remove("acsreadmcount");
+        }
+
+        if (!(appConfigurations.getClientParams(appId).isAdmission570()
+                || appConfigurations.getClientParams(appId).isCmsAdmission())) {
+            validColumns.remove("snfadmitcount");
+            validColumns.remove("snfalos");
+        }
+
+        if (!appConfigurations.getClientParams(appId).isAdmission570()) {
+            validColumns.remove("rehabadmitcount");
+        }
+
+        return validColumns;
+    }
+
+    public IMembersDAO getMembersDAO(String appId) {
+        if (appConfigurations.getClientParams(appId).isDistributedClient()) {
+            return (IMembersDAO) context
+                    .getBean("membersDAODistributed", appId);
+        } else {
+            return context.getBean(IMembersDAO.class, appId);
+        }
+    }
+
+    private ExcelOrCsv<MemberRequestParameters> getExcelOrCsv(String appId,
+                                                              MemberRequestParameters requestParameter,
+                                                              Map<String, Column> columnMap, UserMiscRights miscRights,
+                                                              IMembersDAO membersDAO) {
+        final ExcelOrCsv<MemberRequestParameters> excelOrCsv = new ExcelOrCsv<>();
+        excelOrCsv.setAppId(appId);
+        excelOrCsv.setFormId(FORM_ID);
+        excelOrCsv.setUserMiscRights(miscRights);
+        final QueryAndParamsDTO membersSql = membersDAO
+                .getMembersSql(requestParameter, columnMap);
+        excelOrCsv.setColumnMap(columnMap);
+        excelOrCsv.setMembersSqlWithParams(membersSql);
+        excelOrCsv.setRequestParameter(requestParameter);
+        excelOrCsv.setExtraParamsMapper(extraMetadataWithFilterCriteria -> {
+            final List<Map<String, String>> extraParams = new ArrayList<>();
+            if (null != requestParameter.getExportMetadata()) {
+                Map<String, String> exportMetaData = requestParameter
+                        .getExportMetadata();
+                overrideExportMetaData(appId, requestParameter, exportMetaData);
+                extraParams.add(exportMetaData);
+            }
+            if (requestParameter.getCohort() != null
+                    && requestParameter.getCohort().getName() != null) {
+                extraParams.add(ImmutableMap.of("Cohort Selection",
+                        String.format("%s %s",
+                                requestParameter.getCohort().getName(),
+                                (requestParameter.getCohort().isExcluded() ?
+                                        "[Excluded]" :
+                                        ""))));
+            }
+            if (requestParameter.getFilterCriteria() != null) {
+                extraParams.addAll(ClaimDetailUtil.getSelectedFilterParams(
+                        requestParameter.getFilterCriteria(), brandingService, appId));
+            }
+            if (requestParameter.getExpenseDistributionBucket() != null) {
+                extraParams.add(ImmutableMap.of("Expense Distribution",
+                        requestParameter.getExpenseDistributionBucket()));
+            }
+            if (requestParameter.getSnfFacilityNames() != null
+                    && !requestParameter.getSnfFacilityNames().isEmpty()) {
+                extraParams.add(ImmutableMap.of("SNF Facility Names",
+                        String.join(",",
+                                requestParameter.getSnfFacilityNames())));
+            }
+            return extraParams;
+        });
+
+        return excelOrCsv;
+    }
+
+    /*
+     * (non-Javadoc)
+     * Overrides metadata for Batch report when updating a package or generating reports but not while saving a view.
+     * Specifically overrides the aggregate metrics displayed on 301 screen.
+     */
+    private void overrideExportMetaData(String appId,
+                                        MemberRequestParameters requestParameter,
+                                        Map<String, String> exportMetaData) {
+        // override only when updating or exporting package
+        if (requestParameter.getViewExport() != null
+                && requestParameter.getViewExport().getId() != null
+                && requestParameter.getViewExport().getId() > 0) {
+            MemberRequestParameters reqParam = Cloner
+                    .cloneThis(requestParameter);
+            reqParam.setColumns(getAggregateColumnList());
+            ResponseDTO formAggDto = null;
+            formAggDto = getAggregate(reqParam, appId);
+            LOGGER.debug(" formAggDto agg value {}", formAggDto.getData());
+            // for aggregate, set all filter values except analysis by (paid / incurred) to null
+            MemberRequestParameters aggReqParam = new MemberRequestParameters();
+            aggReqParam.setFilters(reqParam.getFilters());
+            if (aggReqParam.getFilters() == null) {
+                aggReqParam.setFilters(new FiltersDTO());
+            }
+            if (aggReqParam.getFilters().getAnalysisPeriod() == null) {
+                aggReqParam.getFilters()
+                        .setAnalysisPeriod(new AnalysisPeriodDTO());
+            }
+            aggReqParam.getFilters().getAnalysisPeriod()
+                    .setPeriod(Period.FULL_CYCLE);
+            aggReqParam.setColumns(getAggregateColumnList());
+            aggReqParam.getFilters().setBusinessLevels(null);
+            aggReqParam.getFilters().setColumnFilters(new ArrayList<>());
+            aggReqParam.getFilters().setPriorFilters(null);
+
+            ResponseDTO bobAggDto = getAggregate(aggReqParam, appId);
+            LOGGER.debug(" bobAggDto agg value {}", bobAggDto.getData());
+            if (!credentialProvider.getMiscRights().isShowFinancialNumber()) {
+                exportMetaData.entrySet()
+                        .removeIf(e -> e.getValue().startsWith("$"));
+            }
+            MembersServiceUtils
+                    .updateAggregateExportMetaData(formAggDto, bobAggDto,
+                            exportMetaData);
+            LOGGER.debug("Export meta data after update {}", exportMetaData);
+        }
+    }
+
+    private List<String> getAggregateColumnList() {
+        List<String> colList = new ArrayList<>();
+        colList.add("mm:sum");
+        colList.add("rxmm:sum");
+        colList.add("avgrrsnumerator:sum");
+        colList.add("avgrrsdenominator:sum");
+        colList.add("totallowedamt:sum");
+        return colList;
+    }
+
+    private Map<String, Column> getRI005AllColumns(String appId) {
+        Map<String, Column> columnMap = new LinkedHashMap<>();
+        List<Column> allColumns = columnService
+                .getAllColumns("MX_RI005_HMO", appId);
+        allColumns.sort(Comparator
+                .comparing(Column::getLabel, String::compareToIgnoreCase));
+        for (Column col : allColumns) {
+            columnMap.put(col.getName(), col);
+        }
+        if (!credentialProvider.getMiscRights().isRealMemberId()) {
+            columnMap.get("memid").setSortable(false);
+        }
+        if (!credentialProvider.getMiscRights().isHasPHIAccess()) {
+            columnMap.remove("memfirstname");
+            columnMap.remove("memlastname");
+            columnMap.remove("dob");
+        }
+        return columnMap;
+    }
+
+    private boolean isShowMemberRight(UserMiscRights miscRights) {
+        return miscRights.isShowMembername() && miscRights.isDemographic()
+                && miscRights.isRealMemberId();
+    }
+
+    private void revalidateRequestParameter(String appId,
+                                            MemberRequestParameters parameters, IMembersDAO dao) {
+        final UserMiscRights miscRights = credentialProvider.getMiscRights();
+        final ClientParams clientParams = appConfigurations
+                .getClientParams(appId);
+        final String financialSortCol = "totpaidamt";
+        final IMembersDAO membersDAO = getMembersDAO(appId);
+        final String nonFinancialSortCol = clientParams.isDistributedClient() ?
+                "ervisitcount" : "curflag";
+        if (!miscRights.isRiskIndex()) {
+            RequestParameterUtil.setSortAndColFilters(parameters,
+                    Arrays.asList("riskcount", "ari", "ritrend",
+                            "ri30d", "delri", "newari",
+                            "newdelri"), miscRights,
+                    financialSortCol, nonFinancialSortCol);
+        }
+        if (!miscRights.isShowBOBValue()) {
+            RequestParameterUtil.setSortAndColFilters(parameters,
+                    Arrays.asList("normalizedtobookofbusiness",
+                            "predictedallowedamountbb", "relativeriskscorebb"),
+                    miscRights, financialSortCol, nonFinancialSortCol);
+        }
+        final boolean isShowMemberRight = isShowMemberRight(miscRights);
+        if (!isShowMemberRight) {
+            RequestParameterUtil.setSortAndColFilters(parameters,
+                    Arrays.asList(MEM_NAME_COL, "homephone"),
+                    miscRights, financialSortCol, nonFinancialSortCol);
+        }
+        if (!(miscRights.isDemographic() && miscRights.isAllowHRA())) {
+            RequestParameterUtil.setSortAndColFilters(parameters,
+                    Arrays.asList("smoking_yn", "bmi"),
+                    miscRights, financialSortCol, nonFinancialSortCol);
+        }
+        if (!miscRights.isShowUDFFields()) {
+            final List<String> udfFields = parameters.getColumns().stream()
+                    .filter(s -> s.toLowerCase().startsWith("udf"))
+                    .collect(Collectors.toList());
+            RequestParameterUtil.setSortAndColFilters(parameters,
+                    udfFields, miscRights, financialSortCol,
+                    nonFinancialSortCol);
+        }
+        if (!miscRights.isShowFinancialNumber()) {
+            SavedFavSdohDAO sdohDAO = context
+                    .getBean(SavedFavSdohDAO.class, appId);
+            List<Integer> financialTypeMetrics = sdohDAO.getSdohMetricsDollarType();
+            List<String> sdohDollarColumns = financialTypeMetrics.stream().map(e-> "sdoh_" + e.toString()).toList();
+            RequestParameterUtil.setSortAndColFilters(parameters,
+                    sdohDollarColumns, miscRights, financialSortCol,
+                    nonFinancialSortCol);
+            parameters.getSdohEntries().removeIf(e-> financialTypeMetrics.contains(e.getMetricId()));
+        }
+        if (!membersDAO.isEpisodeEnabled() || !miscRights.isShowEpisodeGrouper()) {
+            RequestParameterUtil
+                    .setSortAndColFilters(parameters, "epicount", miscRights,
+                            financialSortCol, nonFinancialSortCol);
+        }
+        if (!miscRights.isAllowHHAProfiler()) {
+            RequestParameterUtil.setSortAndColFilters(parameters,
+                    Arrays.asList("tothhaservices", "avgepispserv",
+                            "totdayshhaservices"),
+                    miscRights, financialSortCol, nonFinancialSortCol);
+        }
+        if (!dao.getVersionControl().isGT790()) {
+            RequestParameterUtil
+                    .setSortAndColFilters(parameters, "populationtype",
+                            miscRights, financialSortCol, nonFinancialSortCol);
+        }
+        if (!clientParams.isReAdmission()) {
+            RequestParameterUtil.setSortAndColFilters(parameters,
+                    Arrays.asList("eligreadmitcount", "acsreadmcount"),
+                    miscRights, financialSortCol, nonFinancialSortCol);
+        }
+        if (!(clientParams.isAdmission570() || clientParams.isCmsAdmission())) {
+            RequestParameterUtil.setSortAndColFilters(parameters,
+                    Arrays.asList("snfadmitcount", "snfalos"),
+                    miscRights, financialSortCol, nonFinancialSortCol);
+        }
+        if (!clientParams.isAdmission570()) {
+            RequestParameterUtil
+                    .setSortAndColFilters(parameters, "rehabadmitcount",
+                            miscRights, financialSortCol, nonFinancialSortCol);
+        }
+        revalidateDob(parameters, miscRights, financialSortCol,
+                nonFinancialSortCol, isShowMemberRight);
+        revalidateMemId(parameters, miscRights, financialSortCol,
+                nonFinancialSortCol, dao);
+        revalidateFinancialDeny(parameters, miscRights, financialSortCol,
+                nonFinancialSortCol);
+        revalidateDxcgDeny(parameters, miscRights, financialSortCol,
+                nonFinancialSortCol);
+        revalidateAge(parameters, miscRights);
+    }
+
+    private void revalidateFinancialDeny(MemberRequestParameters parameters,
+                                         UserMiscRights miscRights, String financialSortCol,
+                                         String nonFinancialSortCol) {
+        if (miscRights.isShowFinancialNumber()) {
+            return;
+        }
+        RequestParameterUtil.setSortAndColFilters(parameters,
+                FINANCIAL_DENIED_COLS, miscRights, financialSortCol,
+                nonFinancialSortCol);
+    }
+
+    private void revalidateDxcgDeny(MemberRequestParameters parameters,
+                                         UserMiscRights miscRights, String financialSortCol,
+                                         String nonFinancialSortCol) {
+        if (miscRights.isDxcgAllowedAmountConfig()) {
+            return;
+        }
+        RequestParameterUtil.setSortAndColFilters(parameters,
+                DXCG_DENIED_COLS, miscRights, financialSortCol,
+                nonFinancialSortCol);
+    }
+
+    private void revalidateMemId(MemberRequestParameters parameters,
+                                 UserMiscRights miscRights, String financialSortCol,
+                                 String nonFinancialSortCol, IMembersDAO dao) {
+        if (!miscRights.isRealMemberId()) {
+            revalidateMemIdForEncoding(parameters, miscRights,
+                    financialSortCol, nonFinancialSortCol, dao, MEMID);
+        } else {
+            revalidateMemIdColFilters(MEMID, parameters, dao, false);
+        }
+    }
+
+    private void revalidateDob(MemberRequestParameters parameters,
+                               UserMiscRights miscRights, String financialSortCol,
+                               String nonFinancialSortCol, boolean isShowMemberRight) {
+        if (!isShowMemberRight && parameters.getColumns().stream().anyMatch(c -> c.equalsIgnoreCase("dob"))) {
+            parameters.getSort().removeIf(s -> "dob".equalsIgnoreCase(s.getField()));
+            RequestParameterUtil.setSorts(parameters.getSort(), miscRights,
+                    financialSortCol, nonFinancialSortCol);
+            final FiltersDTO filters = parameters.getFilters();
+            if (null != filters && !CollectionUtils
+                    .isEmpty(filters.getColumnFilters())) {
+                final List<ColumnFilter> colFilters = filters.getColumnFilters()
+                        .stream().filter(c ->
+                                ColumnFilter.ColumnFilterType.OPERAND == c
+                                        .getType())
+                        .collect(Collectors.toList());
+                colFilters.removeIf(c -> "dob".equalsIgnoreCase(c.getCol()));
+                filters.setColumnFilters(
+                        FilterUtil.getFilterParams(colFilters));
+            }
+        }
+    }
+
+    private void revalidateAge(MemberRequestParameters parameters, UserMiscRights miscRights) {
+        if (!miscRights.isHasPHIAccess() && parameters.getColumns().stream().anyMatch(c -> c.equalsIgnoreCase("age"))) {
+            final FiltersDTO filters = parameters.getFilters();
+            if (null == filters || CollectionUtils.isEmpty(filters.getColumnFilters())) {
+                return;
+            }
+            final List<ColumnFilter> ageColFilters = filters.getColumnFilters().stream().filter(c ->
+                    ColumnFilter.ColumnFilterType.OPERAND == c.getType() && "age".equalsIgnoreCase(c.getCol())).collect(Collectors.toList());
+            Optional.ofNullable(ageColFilters).orElse(Collections.emptyList()).forEach(a -> {
+                final Operator op = a.getOp();
+                final List<Object> values = a.getArgs();
+                final int firstValue = Integer.parseInt(values.get(0).toString());
+                if (Operator.BTWN == op && firstValue <= 89 && Integer.valueOf(values.get(1).toString()) > 89) {
+                    values.set(1, "89");
+                } else if (Operator.BTWN == op && firstValue >= 89 && Integer.valueOf(values.get(1).toString()) > 89) {
+                    a.setOp(Operator.GTE);
+                    values.clear();
+                    values.add("89");
+                } else if ((Operator.GTE == op || Operator.EQ == op || Operator.LTE == op || Operator.NEQ == op) && firstValue > 89) {
+                    values.set(0, "89");
+                }
+            });
+        }
+    }
+
+    private void revalidateMemIdForEncoding(
+            MemberRequestParameters parameters,
+            UserMiscRights miscRights, String financialSortCol,
+            String nonFinancialSortCol, IMembersDAO dao, String memId) {
+        final List<Sort> sorts = parameters.getSort();
+        sorts.removeIf(s -> memId.equalsIgnoreCase(s.getField()));
+        RequestParameterUtil.setSorts(sorts, miscRights, financialSortCol,
+                nonFinancialSortCol);
+        revalidateMemIdColFilters(memId, parameters, dao, true);
+    }
+
+    private void revalidateMemIdColFilters(String memId,
+                                           MemberRequestParameters parameter, IMembersDAO dao,
+                                           boolean isEncoded) {
+        final FiltersDTO dto = parameter.getFilters();
+        if (null == dto || CollectionUtils.isEmpty(dto.getColumnFilters())) {
+            return;
+        }
+        dto.getColumnFilters().forEach(c -> {
+            if (OPERAND == c.getType() && memId.equalsIgnoreCase(c.getCol())) {
+                final List<Object> args = c.getArgs().stream().map(x -> dao
+                        .getRealOrEncodedMemId(x.toString().trim(), isEncoded))
+                        .collect(Collectors.toList());
+                c.setArgs(args);
+            }
+        });
+    }
+
+    public ResponseDTO getGeolocationInfoForMember(String appId, String nmemid) {
+        IMembersDAO membersDAO = getMembersDAO(appId);
+        List<Map<String, Object>> data = membersDAO.getGeolocationDataForMember(nmemid);
+        ResponseDTO responseDTO = new ResponseDTO();
+        responseDTO.setData(data);
+        return responseDTO;
+    }
+}
+
+
+so i need to know the flow how the sql is created using the these functions
+
+
